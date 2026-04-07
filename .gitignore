@@ -1,0 +1,23 @@
+# Node modules
+node_modules/
+
+# Environment variables (CRITICAL)
+.env
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+
+# Build output
+dist/
+build/
+
+# Your project-specific (IMPORTANT)
+workspaces/
+
+# Optional (if you add later)
+coverage/
