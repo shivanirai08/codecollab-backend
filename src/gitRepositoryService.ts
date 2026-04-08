@@ -328,11 +328,18 @@ export async function commitProjectChanges(
     const git = simpleGit(repository.working_tree_path);
     await git.addConfig("user.name", authorName);
     await git.addConfig("user.email", authorEmail);
-    await git.add(".");
 
     const status = await git.status();
-    if (status.isClean()) {
-      throw new Error("There are no changes to commit.");
+    if (status.conflicted.length > 0) {
+      throw new Error("Resolve merge conflicts before committing.");
+    }
+
+    const hasStagedChanges = status.files.some(
+      (file) => file.index && file.index !== " " && file.index !== "?"
+    );
+
+    if (!hasStagedChanges) {
+      throw new Error("Stage at least one change before committing.");
     }
 
     const result = await git.commit(message);
@@ -344,6 +351,64 @@ export async function commitProjectChanges(
     });
 
     return { commitSha };
+  });
+}
+
+export async function stageProjectChanges(
+  projectId: string,
+  options: {
+    paths?: string[];
+    stageAll?: boolean;
+  } = {}
+): Promise<{ status: Awaited<ReturnType<typeof getProjectGitStatus>> }> {
+  return withRepositorySyncState(projectId, async (repository) => {
+    const git = simpleGit(repository.working_tree_path);
+    const paths = (options.paths || [])
+      .map((relativePath) => sanitizeRelativePath(relativePath))
+      .filter(Boolean);
+
+    if (!options.stageAll && paths.length === 0) {
+      throw new Error("Select at least one file to stage.");
+    }
+
+    if (options.stageAll) {
+      await git.add(".");
+    } else {
+      await git.add(paths);
+    }
+
+    return {
+      status: await getProjectGitStatus(projectId),
+    };
+  });
+}
+
+export async function unstageProjectChanges(
+  projectId: string,
+  options: {
+    paths?: string[];
+    unstageAll?: boolean;
+  } = {}
+): Promise<{ status: Awaited<ReturnType<typeof getProjectGitStatus>> }> {
+  return withRepositorySyncState(projectId, async (repository) => {
+    const git = simpleGit(repository.working_tree_path);
+    const paths = (options.paths || [])
+      .map((relativePath) => sanitizeRelativePath(relativePath))
+      .filter(Boolean);
+
+    if (!options.unstageAll && paths.length === 0) {
+      throw new Error("Select at least one file to unstage.");
+    }
+
+    if (options.unstageAll) {
+      await git.raw(["reset", "HEAD", "--", "."]);
+    } else {
+      await git.raw(["reset", "HEAD", "--", ...paths]);
+    }
+
+    return {
+      status: await getProjectGitStatus(projectId),
+    };
   });
 }
 
@@ -372,6 +437,20 @@ export async function pushProjectChanges(
   githubToken: string
 ): Promise<{ pushedAt: string }> {
   return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
+    const status = await git.status();
+
+    if (status.conflicted.length > 0) {
+      throw new Error("Resolve merge conflicts before pushing.");
+    }
+
+    if (!status.isClean()) {
+      throw new Error("Commit or discard local changes before pushing.");
+    }
+
+    if ((status.ahead || 0) === 0) {
+      throw new Error("There are no committed changes to push.");
+    }
+
     const branch = (await git.branch()).current || repository.current_branch;
     await git.push("origin", branch);
     const pushedAt = nowIso();
@@ -391,6 +470,16 @@ export async function pullProjectChanges(
   githubToken: string
 ): Promise<{ pulledAt: string }> {
   return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
+    const status = await git.status();
+
+    if (status.conflicted.length > 0) {
+      throw new Error("Resolve merge conflicts before pulling.");
+    }
+
+    if (!status.isClean()) {
+      throw new Error("Commit or discard local changes before pulling.");
+    }
+
     const branch = (await git.branch()).current || repository.current_branch;
     await git.pull("origin", branch, { "--rebase": null });
     const pulledAt = nowIso();
