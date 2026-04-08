@@ -15,6 +15,57 @@ type NodeRow = {
   id: string;
 };
 
+export type ProjectRepositoryRow = {
+  id: string;
+  project_id: string;
+  provider: string;
+  github_repo_id: number | null;
+  repo_name: string;
+  repo_full_name: string;
+  repo_url: string;
+  clone_url: string | null;
+  default_branch: string | null;
+  current_branch: string;
+  is_private: boolean;
+  is_connected: boolean;
+  last_synced_at: string | null;
+  last_pulled_at: string | null;
+  last_pushed_at: string | null;
+  last_commit_sha: string | null;
+  working_tree_path: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  install_status: string;
+  sync_state: string;
+  sync_error: string | null;
+  remote_head_sha: string | null;
+};
+
+type ProjectRepositoryInsertPayload = {
+  project_id: string;
+  provider?: string;
+  github_repo_id?: number | null;
+  repo_name: string;
+  repo_full_name: string;
+  repo_url: string;
+  clone_url?: string | null;
+  default_branch?: string | null;
+  current_branch: string;
+  is_private?: boolean;
+  is_connected?: boolean;
+  last_synced_at?: string | null;
+  last_pulled_at?: string | null;
+  last_pushed_at?: string | null;
+  last_commit_sha?: string | null;
+  working_tree_path: string;
+  created_by: string;
+  install_status?: string;
+  sync_state?: string;
+  sync_error?: string | null;
+  remote_head_sha?: string | null;
+};
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -127,5 +178,61 @@ export async function deleteProjectTree(projectId: string): Promise<void> {
   await supabaseRequest("projects", {
     method: "DELETE",
     query: `?id=${encodedProjectId}`,
+  }).catch(() => {});
+}
+
+export async function deleteProjectNodes(projectId: string): Promise<void> {
+  const encodedProjectId = encodeURIComponent(`eq.${projectId}`);
+  await supabaseRequest("nodes", {
+    method: "DELETE",
+    query: `?project_id=${encodedProjectId}`,
+  });
+}
+
+export async function createProjectRepositoryRecord(
+  payload: ProjectRepositoryInsertPayload
+): Promise<ProjectRepositoryRow> {
+  const result = await supabaseRequest<ProjectRepositoryRow[]>("project_repositories", {
+    method: "POST",
+    body: payload,
+  });
+
+  if (!result?.[0]) {
+    throw new Error("Failed to create project repository record.");
+  }
+
+  return result[0];
+}
+
+export async function getProjectRepositoryRecord(
+  projectId: string
+): Promise<ProjectRepositoryRow | null> {
+  const encodedProjectId = encodeURIComponent(`eq.${projectId}`);
+  const result = await supabaseRequest<ProjectRepositoryRow[]>("project_repositories", {
+    query: `?project_id=${encodedProjectId}&limit=1`,
+  });
+
+  return result?.[0] || null;
+}
+
+export async function updateProjectRepositoryRecord(
+  projectId: string,
+  updates: Partial<ProjectRepositoryRow>
+): Promise<ProjectRepositoryRow | null> {
+  const encodedProjectId = encodeURIComponent(`eq.${projectId}`);
+  const result = await supabaseRequest<ProjectRepositoryRow[]>("project_repositories", {
+    method: "PATCH",
+    body: updates,
+    query: `?project_id=${encodedProjectId}`,
+  });
+
+  return result?.[0] || null;
+}
+
+export async function deleteProjectRepositoryRecord(projectId: string): Promise<void> {
+  const encodedProjectId = encodeURIComponent(`eq.${projectId}`);
+  await supabaseRequest("project_repositories", {
+    method: "DELETE",
+    query: `?project_id=${encodedProjectId}`,
   }).catch(() => {});
 }

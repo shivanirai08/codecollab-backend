@@ -6,8 +6,16 @@ import express, {
 } from "express";
 import cors from "cors";
 import {
-  importGitHubRepositoryIntoProject,
-  ImportValidationError,
+  applyWorktreeOperation,
+  commitProjectChanges,
+  getProjectGitStatus,
+  getProjectGitStatusWithRemote,
+  pullProjectChanges,
+  pushProjectChanges,
+} from "./src/gitRepositoryService.ts";
+import {
+  importGitHubRepositoryIntoProject as importGitHubRepositoryIntoProjectLegacy,
+  ImportValidationError as ImportValidationErrorLegacy,
 } from "./src/githubImport.ts";
 
 const app = express();
@@ -43,13 +51,13 @@ app.get("/", (_req: Request, res: Response) => {
 
 app.post("/github/import", requireInternalSecret, async (req: Request, res: Response) => {
   try {
-    const result = await importGitHubRepositoryIntoProject(req.body);
+    const result = await importGitHubRepositoryIntoProjectLegacy(req.body);
     res.status(201).json({
       message: "Repository imported successfully.",
       ...result,
     });
   } catch (error) {
-    if (error instanceof ImportValidationError) {
+    if (error instanceof ImportValidationErrorLegacy) {
       res.status(error.statusCode).json({ error: error.message });
       return;
     }
@@ -59,6 +67,68 @@ app.post("/github/import", requireInternalSecret, async (req: Request, res: Resp
 
     console.error("GitHub import failed:", error);
     res.status(500).json({ error: message });
+  }
+});
+
+app.post("/projects/:projectId/worktree/sync", requireInternalSecret, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    await applyWorktreeOperation(projectId, req.body);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to sync worktree.";
+    res.status(400).json({ error: message });
+  }
+});
+
+app.get("/projects/:projectId/git/status", requireInternalSecret, async (req, res) => {
+  try {
+    const githubToken = req.header("x-github-token") || undefined;
+    const result = await getProjectGitStatusWithRemote(req.params.projectId, githubToken);
+    res.status(200).json(result);
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load git status.";
+    res.status(400).json({ error: message });
+  }
+});
+
+app.post("/projects/:projectId/git/commit", requireInternalSecret, async (req, res) => {
+  try {
+    const result = await commitProjectChanges(req.params.projectId, req.body);
+    const status = await getProjectGitStatus(req.params.projectId);
+    res.status(200).json({ ...result, status });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to commit changes.";
+    res.status(400).json({ error: message });
+  }
+});
+
+app.post("/projects/:projectId/git/push", requireInternalSecret, async (req, res) => {
+  try {
+    const { githubToken } = req.body || {};
+    const result = await pushProjectChanges(req.params.projectId, githubToken);
+    const status = await getProjectGitStatus(req.params.projectId);
+    res.status(200).json({ ...result, status });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to push changes.";
+    res.status(400).json({ error: message });
+  }
+});
+
+app.post("/projects/:projectId/git/pull", requireInternalSecret, async (req, res) => {
+  try {
+    const { githubToken } = req.body || {};
+    const result = await pullProjectChanges(req.params.projectId, githubToken);
+    const status = await getProjectGitStatus(req.params.projectId);
+    res.status(200).json({ ...result, status });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to pull changes.";
+    res.status(400).json({ error: message });
   }
 });
 

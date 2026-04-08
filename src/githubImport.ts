@@ -1,8 +1,12 @@
-import os from "os";
 import path from "path";
 import { promises as fs } from "fs";
 import { simpleGit } from "simple-git";
-import { createNodeRecord, deleteProjectTree } from "./supabase.ts";
+import {
+  createNodeRecord,
+  createProjectRepositoryRecord,
+  deleteProjectRepositoryRecord,
+  deleteProjectTree,
+} from "./supabase.ts";
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",
@@ -23,6 +27,8 @@ type NodeType = "file" | "folder";
 type RepositoryPayload = {
   name: string;
   fullName: string;
+  repoUrl?: string | null;
+  githubRepoId?: number | null;
   private?: boolean;
   defaultBranch?: string | null;
   cloneUrl?: string | null;
@@ -30,6 +36,7 @@ type RepositoryPayload = {
 
 type ImportPayload = {
   projectId?: string;
+  userId?: string;
   githubToken?: string;
   repo?: RepositoryPayload;
 };
@@ -144,7 +151,7 @@ function isBinaryFile(buffer: Buffer): boolean {
   return false;
 }
 
-async function walkRepositoryTree(
+export async function walkRepositoryTree(
   rootDirectory: string
 ): Promise<{ records: NodeRecordInput[]; stats: ImportStats }> {
   const records: NodeRecordInput[] = [];
@@ -238,7 +245,7 @@ async function walkRepositoryTree(
   };
 }
 
-async function persistRecords({
+export async function persistRecords({
   projectId,
   records,
 }: {
@@ -267,13 +274,20 @@ async function persistRecords({
 export async function importGitHubRepositoryIntoProject(payload: ImportPayload): Promise<{
   projectId: string;
   repository: {
+    id: string;
+    provider: string;
     name: string;
     fullName: string;
+    repoUrl: string;
     defaultBranch: string | null;
+    currentBranch: string;
+    isPrivate: boolean;
+    workingTreePath: string;
   };
   stats: ImportStats;
 }> {
   const projectId = payload?.projectId;
+  const userId = payload?.userId;
   const githubToken = payload?.githubToken;
   const repo = payload?.repo;
 
@@ -285,6 +299,10 @@ export async function importGitHubRepositoryIntoProject(payload: ImportPayload):
     throw new ImportValidationError("GitHub token is required.", 401);
   }
 
+  if (!userId) {
+    throw new ImportValidationError("User id is required.");
+  }
+
   if (!repo?.name || !repo?.fullName) {
     throw new ImportValidationError("Repository details are incomplete.");
   }
@@ -294,13 +312,13 @@ export async function importGitHubRepositoryIntoProject(payload: ImportPayload):
     throw new ImportValidationError("Invalid project id.");
   }
 
-  const checkoutDirectory = path.join(
-    os.tmpdir(),
-    "codecollab-imports",
-    `${safeProjectId}-${Date.now()}`
-  );
+  const worktreesRoot =
+    process.env.CODECOLLAB_REPOS_ROOT ||
+    path.join(process.cwd(), ".data", "worktrees");
+  const checkoutDirectory = path.join(worktreesRoot, safeProjectId);
 
-  await fs.mkdir(checkoutDirectory, { recursive: true });
+  await fs.rm(checkoutDirectory, { recursive: true, force: true }).catch(() => {});
+  await fs.mkdir(path.dirname(checkoutDirectory), { recursive: true });
 
   try {
     const cloneUrl = buildCloneUrl({
@@ -317,6 +335,14 @@ export async function importGitHubRepositoryIntoProject(payload: ImportPayload):
       ...(repo.defaultBranch ? ["--branch", repo.defaultBranch] : []),
     ]);
 
+    const projectGit = simpleGit(checkoutDirectory);
+    const currentBranch = (await projectGit.branch()).current || repo.defaultBranch || "main";
+    await projectGit.remote([
+      "set-url",
+      "origin",
+      repo.cloneUrl || `https://github.com/${repo.fullName}.git`,
+    ]);
+
     const { records, stats } = await walkRepositoryTree(checkoutDirectory);
 
     if (records.length === 0) {
@@ -326,20 +352,44 @@ export async function importGitHubRepositoryIntoProject(payload: ImportPayload):
     }
 
     await persistRecords({ projectId, records });
-
+    const repositoryRecord = await createProjectRepositoryRecord({
+      project_id: projectId,
+      provider: "github",
+      github_repo_id: repo.githubRepoId || null,
+      repo_name: repo.name,
+      repo_full_name: repo.fullName,
+      repo_url: repo.repoUrl || `https://github.com/${repo.fullName}`,
+      clone_url: repo.cloneUrl || `https://github.com/${repo.fullName}.git`,
+      default_branch: repo.defaultBranch || null,
+      current_branch: currentBranch,
+      is_private: Boolean(repo.private),
+      is_connected: true,
+      last_synced_at: new Date().toISOString(),
+      last_commit_sha: await projectGit.revparse(["HEAD"]).catch(() => null),
+      working_tree_path: checkoutDirectory,
+      created_by: userId,
+      install_status: "ready",
+      sync_state: "idle",
+      remote_head_sha: null,
+    });
     return {
       projectId,
       repository: {
+        id: repositoryRecord.id,
+        provider: repositoryRecord.provider,
         name: repo.name,
         fullName: repo.fullName,
+        repoUrl: repositoryRecord.repo_url,
         defaultBranch: repo.defaultBranch || null,
+        currentBranch,
+        isPrivate: Boolean(repo.private),
+        workingTreePath: checkoutDirectory,
       },
       stats,
     };
   } catch (error) {
+    await deleteProjectRepositoryRecord(projectId).catch(() => {});
     await deleteProjectTree(projectId).catch(() => {});
     throw error;
-  } finally {
-    await fs.rm(checkoutDirectory, { recursive: true, force: true }).catch(() => {});
   }
 }
