@@ -8,6 +8,7 @@ import cors from "cors";
 import {
   applyWorktreeOperation,
   commitProjectChanges,
+  getProjectFileDiff,
   getProjectGitStatus,
   getProjectGitStatusWithRemote,
   pullProjectChanges,
@@ -93,6 +94,29 @@ app.get("/projects/:projectId/git/status", requireInternalSecret, async (req: Re
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to load git status.";
+    res.status(400).json({ error: message });
+  }
+});
+
+app.get("/projects/:projectId/git/diff", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const relativePath = String(req.query.path || "").trim();
+
+    if (!relativePath) {
+      res.status(400).json({ error: "Query parameter 'path' is required." });
+      return;
+    }
+
+    const result = await getProjectFileDiff(req.params.projectId, {
+      relativePath,
+      includeStaged: true,
+      includeUnstaged: true,
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load diff.";
     res.status(400).json({ error: message });
   }
 });

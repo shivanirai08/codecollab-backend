@@ -312,6 +312,68 @@ export async function getProjectGitStatusWithRemote(
   }
 }
 
+export async function getProjectFileDiff(
+  projectId: string,
+  options: {
+    relativePath: string;
+    includeStaged?: boolean;
+    includeUnstaged?: boolean;
+  }
+): Promise<{ path: string; diff: string }> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+  const safePath = sanitizeRelativePath(options.relativePath);
+  const includeStaged = options.includeStaged !== false;
+  const includeUnstaged = options.includeUnstaged !== false;
+  const chunks: string[] = [];
+
+  if (includeStaged) {
+    const stagedDiff = await git.diff(["--cached", "--", safePath]);
+    if (stagedDiff.trim()) {
+      chunks.push(stagedDiff.trimEnd());
+    }
+  }
+
+  if (includeUnstaged) {
+    const unstagedDiff = await git.diff(["--", safePath]);
+    if (unstagedDiff.trim()) {
+      chunks.push(unstagedDiff.trimEnd());
+    }
+  }
+
+  if (chunks.length === 0) {
+    const status = await git.status();
+    const fileEntry = status.files.find((file) => file.path === safePath);
+    const isUntracked =
+      fileEntry?.index === "?" || fileEntry?.working_dir === "?";
+
+    if (isUntracked) {
+      const absolutePath = resolveWorktreePath(repository.working_tree_path, safePath);
+      const content = await fs.readFile(absolutePath, "utf8").catch(() => "");
+      const contentLines = content.split("\n");
+      const previewLines = contentLines.slice(0, 400);
+      const addedLines = previewLines.map((line) => `+${line}`).join("\n");
+      const lineCount = Math.max(previewLines.length, 1);
+
+      const syntheticDiff = [
+        `diff --git a/${safePath} b/${safePath}`,
+        "new file mode 100644",
+        "index 0000000..0000000",
+        "--- /dev/null",
+        `+++ b/${safePath}`,
+        `@@ -0,0 +1,${lineCount} @@`,
+        addedLines || "+",
+      ].join("\n");
+
+      chunks.push(syntheticDiff.trimEnd());
+    }
+  }
+
+  return {
+    path: safePath,
+    diff: chunks.join("\n\n").trim(),
+  };
+}
+
 export async function commitProjectChanges(
   projectId: string,
   {
