@@ -8,12 +8,14 @@ import cors from "cors";
 import {
   applyWorktreeOperation,
   commitProjectChanges,
+  getGitActionErrorStatus,
   getProjectFileDiff,
   getProjectGitStatus,
   getProjectGitStatusWithRemote,
   pullProjectChanges,
   pushProjectChanges,
   stageProjectChanges,
+  toGitActionErrorResponse,
   unstageProjectChanges,
 } from "./src/gitRepositoryService.ts";
 import {
@@ -127,9 +129,9 @@ app.post("/projects/:projectId/git/commit", requireInternalSecret, async (req: R
     const status = await getProjectGitStatus(req.params.projectId);
     res.status(200).json({ ...result, status });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to commit changes.";
-    res.status(400).json({ error: message });
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to commit changes.", "Commit failed"));
   }
 });
 
@@ -138,9 +140,9 @@ app.post("/projects/:projectId/git/stage", requireInternalSecret, async (req: Re
     const result = await stageProjectChanges(req.params.projectId, req.body || {});
     res.status(200).json(result);
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to stage changes.";
-    res.status(400).json({ error: message });
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to stage changes.", "Stage failed"));
   }
 });
 
@@ -149,9 +151,9 @@ app.post("/projects/:projectId/git/unstage", requireInternalSecret, async (req: 
     const result = await unstageProjectChanges(req.params.projectId, req.body || {});
     res.status(200).json(result);
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to unstage changes.";
-    res.status(400).json({ error: message });
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to unstage changes.", "Unstage failed"));
   }
 });
 
@@ -162,9 +164,9 @@ app.post("/projects/:projectId/git/push", requireInternalSecret, async (req: Req
     const status = await getProjectGitStatus(req.params.projectId);
     res.status(200).json({ ...result, status });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to push changes.";
-    res.status(400).json({ error: message });
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to push changes.", "Push failed"));
   }
 });
 
@@ -175,9 +177,9 @@ app.post("/projects/:projectId/git/pull", requireInternalSecret, async (req: Req
     const status = await getProjectGitStatus(req.params.projectId);
     res.status(200).json({ ...result, status });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to pull changes.";
-    res.status(400).json({ error: message });
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to pull changes.", "Pull failed"));
   }
 });
 

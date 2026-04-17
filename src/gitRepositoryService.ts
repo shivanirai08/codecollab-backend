@@ -32,8 +32,167 @@ type WorktreeOperation =
       nodeType: "file" | "folder";
     };
 
+export type GitActionSuggestion =
+  | "pull"
+  | "push"
+  | "commit"
+  | "stage"
+  | "resolve-conflicts"
+  | "connect-github"
+  | "retry";
+
+export type GitActionErrorResponse = {
+  error: string;
+  code: string;
+  title: string;
+  hint?: string;
+  suggestedAction?: GitActionSuggestion;
+  details?: string;
+};
+
+type GitActionErrorOptions = GitActionErrorResponse & {
+  statusCode?: number;
+};
+
+export class GitActionError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+  readonly title: string;
+  readonly hint?: string;
+  readonly suggestedAction?: GitActionSuggestion;
+  readonly details?: string;
+
+  constructor(options: GitActionErrorOptions) {
+    super(options.error);
+    this.name = "GitActionError";
+    this.statusCode = options.statusCode || 400;
+    this.code = options.code;
+    this.title = options.title;
+    this.hint = options.hint;
+    this.suggestedAction = options.suggestedAction;
+    this.details = options.details;
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function sanitizeGitDetails(value: string): string | undefined {
+  const sanitized = String(value || "").trim();
+  return sanitized ? sanitized : undefined;
+}
+
+export function toGitActionErrorResponse(
+  error: unknown,
+  fallbackMessage: string,
+  fallbackTitle = "Git action failed"
+): GitActionErrorResponse {
+  if (error instanceof GitActionError) {
+    return {
+      error: error.message,
+      code: error.code,
+      title: error.title,
+      hint: error.hint,
+      suggestedAction: error.suggestedAction,
+      details: error.details,
+    };
+  }
+
+  const rawMessage =
+    error instanceof Error ? error.message : String(error || fallbackMessage);
+  const message = collapseWhitespace(rawMessage);
+  const details = sanitizeGitDetails(rawMessage);
+
+  if (
+    /non-fast-forward|failed to push some refs|updates were rejected because|tip of your current branch is behind/i.test(
+      rawMessage
+    )
+  ) {
+    return {
+      error: "Pull the latest changes before pushing.",
+      code: "remote-ahead",
+      title: "Remote branch has new commits",
+      hint: "Your branch is behind the remote branch. Pull, review any incoming changes, then push again.",
+      suggestedAction: "pull",
+      details,
+    };
+  }
+
+  if (
+    /authentication failed|could not read username|permission to .* denied|repository not found/i.test(
+      rawMessage
+    )
+  ) {
+    return {
+      error: "GitHub rejected the request.",
+      code: "github-auth-failed",
+      title: "GitHub authorization needs attention",
+      hint: "Reconnect your GitHub account or verify that you still have permission to this repository.",
+      suggestedAction: "connect-github",
+      details,
+    };
+  }
+
+  if (
+    /conflict|automatic merge failed|could not apply|merge conflict/i.test(
+      rawMessage
+    )
+  ) {
+    return {
+      error: "Resolve the conflicting files before continuing.",
+      code: "merge-conflict",
+      title: "Git found conflicting changes",
+      hint: "Open the conflicted files, remove the conflict markers, stage the files, and try again.",
+      suggestedAction: "resolve-conflicts",
+      details,
+    };
+  }
+
+  if (/timed out|connection reset|network|econnrefused|unable to access/i.test(rawMessage)) {
+    return {
+      error: "The repository could not be reached right now.",
+      code: "network-error",
+      title: "Network request failed",
+      hint: "Check your connection and try again in a moment.",
+      suggestedAction: "retry",
+      details,
+    };
+  }
+
+  return {
+    error: message || fallbackMessage,
+    code: "git-operation-failed",
+    title: fallbackTitle,
+    hint: "Try again after refreshing the repository status.",
+    suggestedAction: "retry",
+    details,
+  };
+}
+
+export function getGitActionErrorStatus(error: unknown): number {
+  if (error instanceof GitActionError) {
+    return error.statusCode;
+  }
+
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (
+    /non-fast-forward|failed to push some refs|updates were rejected because|conflict|automatic merge failed/i.test(
+      message
+    )
+  ) {
+    return 409;
+  }
+
+  if (/authentication failed|permission to .* denied|repository not found/i.test(message)) {
+    return 401;
+  }
+
+  return 400;
 }
 
 function getCleanCloneUrl(repository: ProjectRepositoryRow): string {
@@ -182,6 +341,29 @@ export async function applyWorktreeOperation(
   });
 }
 
+type ConflictType =
+  | "both-modified"
+  | "both-added"
+  | "both-deleted"
+  | "added-by-us"
+  | "added-by-them"
+  | "deleted-by-us"
+  | "deleted-by-them"
+  | "unmerged";
+
+function resolveConflictType(code: string): ConflictType {
+  switch (code) {
+    case "UU": return "both-modified";
+    case "AA": return "both-added";
+    case "DD": return "both-deleted";
+    case "AU": return "added-by-us";
+    case "UA": return "added-by-them";
+    case "DU": return "deleted-by-us";
+    case "UD": return "deleted-by-them";
+    default:   return "unmerged";
+  }
+}
+
 export async function getProjectGitStatus(projectId: string): Promise<{
   branch: string | null;
   tracking: string | null;
@@ -189,6 +371,7 @@ export async function getProjectGitStatus(projectId: string): Promise<{
   behind: number;
   isClean: boolean;
   hasConflicts: boolean;
+  conflictedPaths: string[];
   summary: {
     modified: number;
     added: number;
@@ -202,35 +385,67 @@ export async function getProjectGitStatus(projectId: string): Promise<{
     indexStatus: string;
     workingTreeStatus: string;
     status: string;
+    conflictType: ConflictType | null;
     staged: boolean;
     unstaged: boolean;
   }>;
 }> {
   const { repository, git } = await getSimpleGitForProject(projectId);
   const status = await git.status();
+
+  // simple-git parses the porcelain output and provides an authoritative set
+  // of unmerged (conflicted) paths.  We use this as the primary source of truth
+  // and fall back to the XY status-code analysis for any file that the array
+  // might miss in edge cases.
+  const conflictedPathSet = new Set(status.conflicted);
+
   const files = status.files.map((file) => {
     const indexStatus = file.index || " ";
     const workingTreeStatus = file.working_dir || " ";
     const code = `${indexStatus}${workingTreeStatus}`.trim() || "clean";
     const isUntracked = indexStatus === "?" || workingTreeStatus === "?";
+
+    // Authoritative conflict check: simple-git's own conflicted list
+    // PLUS the XY two-char codes that indicate an unmerged state.
     const isConflicted =
+      conflictedPathSet.has(file.path) ||
       indexStatus === "U" ||
       workingTreeStatus === "U" ||
-      code.includes("AA") ||
-      code.includes("DD");
+      code === "AA" ||
+      code === "DD";
+
+    const conflictType: ConflictType | null = isConflicted
+      ? resolveConflictType(code)
+      : null;
 
     return {
       path: file.path,
       indexStatus,
       workingTreeStatus,
       status: isConflicted ? "conflicted" : isUntracked ? "untracked" : code,
-      staged: indexStatus !== " " && indexStatus !== "?",
-      unstaged:
-        workingTreeStatus !== " " ||
-        indexStatus === "?" ||
-        workingTreeStatus === "?",
+      conflictType,
+      // Conflicted files must not appear as staged/unstaged – they need
+      // conflict resolution before they can participate in staging.
+      staged: !isConflicted && indexStatus !== " " && indexStatus !== "?",
+      unstaged: !isConflicted && (workingTreeStatus !== " " || indexStatus === "?"),
     };
   });
+
+  // For any file that simple-git placed in conflicted[] but that did not appear
+  // in files[] (rare), add a synthetic sparse entry so the panel always shows it.
+  for (const conflictedPath of status.conflicted) {
+    if (!files.some((f) => f.path === conflictedPath)) {
+      files.push({
+        path: conflictedPath,
+        indexStatus: "U",
+        workingTreeStatus: "U",
+        status: "conflicted",
+        conflictType: "both-modified",
+        staged: false,
+        unstaged: false,
+      });
+    }
+  }
 
   const summary = {
     modified: files.filter((file) => file.status.includes("M")).length,
@@ -259,6 +474,7 @@ export async function getProjectGitStatus(projectId: string): Promise<{
     behind: status.behind || 0,
     isClean: status.isClean(),
     hasConflicts: summary.conflicted > 0,
+    conflictedPaths: Array.from(conflictedPathSet),
     summary,
     files,
   };
@@ -319,11 +535,25 @@ export async function getProjectFileDiff(
     includeStaged?: boolean;
     includeUnstaged?: boolean;
   }
-): Promise<{ path: string; diff: string }> {
+): Promise<{ path: string; diff: string; isConflicted?: boolean }> {
   const { repository, git } = await getSimpleGitForProject(projectId);
   const safePath = sanitizeRelativePath(options.relativePath);
   const includeStaged = options.includeStaged !== false;
   const includeUnstaged = options.includeUnstaged !== false;
+
+  // Detect whether this file is currently unmerged BEFORE attempting a diff.
+  // Unmerged files don't produce output from `git diff` – the working-tree
+  // file itself holds the conflict markers (<<<<<<<, =======, >>>>>>>).
+  // Reading the file directly is the only reliable way to surface them.
+  const status = await git.status();
+  const isConflicted = status.conflicted.includes(safePath);
+
+  if (isConflicted) {
+    const absolutePath = resolveWorktreePath(repository.working_tree_path, safePath);
+    const content = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    return { path: safePath, diff: content, isConflicted: true };
+  }
+
   const chunks: string[] = [];
 
   if (includeStaged) {
@@ -371,6 +601,7 @@ export async function getProjectFileDiff(
   return {
     path: safePath,
     diff: chunks.join("\n\n").trim(),
+    isConflicted: false,
   };
 }
 
@@ -393,7 +624,14 @@ export async function commitProjectChanges(
 
     const status = await git.status();
     if (status.conflicted.length > 0) {
-      throw new Error("Resolve merge conflicts before committing.");
+      throw new GitActionError({
+        error: "Resolve merge conflicts before committing.",
+        code: "commit-conflicts",
+        title: "Conflicts need attention",
+        hint: "Fix the conflicted files, stage them again, then commit.",
+        suggestedAction: "resolve-conflicts",
+        statusCode: 409,
+      });
     }
 
     const hasStagedChanges = status.files.some(
@@ -401,7 +639,14 @@ export async function commitProjectChanges(
     );
 
     if (!hasStagedChanges) {
-      throw new Error("Stage at least one change before committing.");
+      throw new GitActionError({
+        error: "Stage at least one change before committing.",
+        code: "nothing-staged",
+        title: "Nothing is staged",
+        hint: "Choose one or more changed files from the list, stage them, then commit.",
+        suggestedAction: "stage",
+        statusCode: 400,
+      });
     }
 
     const result = await git.commit(message);
@@ -430,7 +675,14 @@ export async function stageProjectChanges(
       .filter(Boolean);
 
     if (!options.stageAll && paths.length === 0) {
-      throw new Error("Select at least one file to stage.");
+      throw new GitActionError({
+        error: "Select at least one file to stage.",
+        code: "no-stage-selection",
+        title: "No files selected",
+        hint: "Pick one or more files from the changes list, then stage them.",
+        suggestedAction: "stage",
+        statusCode: 400,
+      });
     }
 
     if (options.stageAll) {
@@ -459,7 +711,14 @@ export async function unstageProjectChanges(
       .filter(Boolean);
 
     if (!options.unstageAll && paths.length === 0) {
-      throw new Error("Select at least one file to unstage.");
+      throw new GitActionError({
+        error: "Select at least one file to unstage.",
+        code: "no-unstage-selection",
+        title: "No files selected",
+        hint: "Pick one or more staged files before trying to unstage them.",
+        suggestedAction: "stage",
+        statusCode: 400,
+      });
     }
 
     if (options.unstageAll) {
@@ -502,15 +761,47 @@ export async function pushProjectChanges(
     const status = await git.status();
 
     if (status.conflicted.length > 0) {
-      throw new Error("Resolve merge conflicts before pushing.");
+      throw new GitActionError({
+        error: "Resolve merge conflicts before pushing.",
+        code: "push-conflicts",
+        title: "Conflicts need attention",
+        hint: "Finish resolving the conflicted files and commit the result before pushing.",
+        suggestedAction: "resolve-conflicts",
+        statusCode: 409,
+      });
     }
 
     if (!status.isClean()) {
-      throw new Error("Commit or discard local changes before pushing.");
+      throw new GitActionError({
+        error: "Commit or discard local changes before pushing.",
+        code: "push-dirty-worktree",
+        title: "Finish local changes first",
+        hint: "Push only sends committed work. Commit your changes or discard them, then try again.",
+        suggestedAction: "commit",
+        statusCode: 400,
+      });
     }
 
     if ((status.ahead || 0) === 0) {
-      throw new Error("There are no committed changes to push.");
+      throw new GitActionError({
+        error: "There are no committed changes to push.",
+        code: "nothing-to-push",
+        title: "Nothing to push",
+        hint: "Create a commit first, then push it to GitHub.",
+        suggestedAction: "commit",
+        statusCode: 400,
+      });
+    }
+
+    if ((status.behind || 0) > 0) {
+      throw new GitActionError({
+        error: "Pull the latest changes before pushing.",
+        code: "remote-ahead",
+        title: "Remote branch has new commits",
+        hint: "Your branch is behind the remote branch. Pull, review the updates, then push again.",
+        suggestedAction: "pull",
+        statusCode: 409,
+      });
     }
 
     const branch = (await git.branch()).current || repository.current_branch;
@@ -535,11 +826,25 @@ export async function pullProjectChanges(
     const status = await git.status();
 
     if (status.conflicted.length > 0) {
-      throw new Error("Resolve merge conflicts before pulling.");
+      throw new GitActionError({
+        error: "Resolve merge conflicts before pulling.",
+        code: "pull-conflicts",
+        title: "Conflicts need attention",
+        hint: "Finish resolving the conflicted files before pulling new changes.",
+        suggestedAction: "resolve-conflicts",
+        statusCode: 409,
+      });
     }
 
     if (!status.isClean()) {
-      throw new Error("Commit or discard local changes before pulling.");
+      throw new GitActionError({
+        error: "Commit or discard local changes before pulling.",
+        code: "pull-dirty-worktree",
+        title: "Finish local changes first",
+        hint: "Pull can reapply your branch on top of remote changes. Commit or discard local edits first.",
+        suggestedAction: "commit",
+        statusCode: 400,
+      });
     }
 
     const branch = (await git.branch()).current || repository.current_branch;
