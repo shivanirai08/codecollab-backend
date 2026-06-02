@@ -55,6 +55,19 @@ app.get("/", (_req: Request, res: Response) => {
   res.send("Backend running");
 });
 
+app.get("/health", (_req: Request, res: Response) => {
+  res.status(200).json({
+    status: "ok",
+    service: "codecollab-backend",
+    uptimeSeconds: Number(process.uptime().toFixed(2)),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/healthz", (_req: Request, res: Response) => {
+  res.redirect(302, "/health");
+});
+
 app.post("/github/import", requireInternalSecret, async (req: Request, res: Response) => {
   try {
     const result = await importGitHubRepositoryIntoProjectLegacy(req.body);
