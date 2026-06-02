@@ -288,7 +288,50 @@ async function getSimpleGitForProject(projectId: string): Promise<{
     throw new Error("Project repository is not connected.");
   }
 
-  const git = simpleGit(repository.working_tree_path);
+  const configuredWorktreeRoot =
+    process.env.CODECOLLAB_REPOS_ROOT ||
+    path.join(process.cwd(), ".data", "worktrees");
+
+  const pathExists = async (candidatePath: string): Promise<boolean> => {
+    try {
+      const stat = await fs.stat(candidatePath);
+      return stat.isDirectory();
+    } catch {
+      return false;
+    }
+  };
+
+  let workingTreePath = repository.working_tree_path;
+  const hasStoredWorktree = await pathExists(workingTreePath);
+
+  if (!hasStoredWorktree) {
+    const fallbackWorktreePath = path.join(configuredWorktreeRoot, projectId);
+    const hasFallbackWorktree = await pathExists(fallbackWorktreePath);
+
+    if (hasFallbackWorktree) {
+      workingTreePath = fallbackWorktreePath;
+      await updateProjectRepositoryRecord(projectId, {
+        working_tree_path: fallbackWorktreePath,
+      }).catch(() => {});
+    } else {
+      await updateProjectRepositoryRecord(projectId, {
+        sync_state: "error",
+        sync_error: `Repository worktree is missing at '${repository.working_tree_path}'.`,
+      }).catch(() => {});
+
+      throw new GitActionError({
+        statusCode: 409,
+        code: "repository-worktree-missing",
+        title: "Repository worktree is unavailable",
+        error: "Repository files are not available on this backend instance.",
+        hint: "Re-import this repository from GitHub, or use the backend instance that originally imported it.",
+        suggestedAction: "connect-github",
+        details: `Missing path: ${repository.working_tree_path}`,
+      });
+    }
+  }
+
+  const git = simpleGit(workingTreePath);
   return { repository, git };
 }
 
