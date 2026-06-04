@@ -236,3 +236,70 @@ export async function deleteProjectRepositoryRecord(projectId: string): Promise<
     query: `?project_id=${encodedProjectId}`,
   }).catch(() => {});
 }
+
+export type NodeWithPath = {
+  id: string;
+  project_id: string;
+  parent_id: string | null;
+  name: string;
+  type: "file" | "folder";
+  content: string;
+  language?: string | null;
+  relativePath: string;
+};
+
+export async function getAllProjectNodes(projectId: string): Promise<NodeWithPath[]> {
+  const encodedProjectId = encodeURIComponent(`eq.${projectId}`);
+  const result = await supabaseRequest<any[]>("nodes", {
+    query: `?project_id=${encodedProjectId}&select=id,project_id,parent_id,name,type,content,language`,
+  });
+
+  if (!result) {
+    return [];
+  }
+
+  // Build path map (relative paths for each node)
+  const nodeMap = new Map<string, any>(result.map((n) => [n.id, n]));
+  const nodes: NodeWithPath[] = [];
+
+  for (const node of result) {
+    const pathSegments: string[] = [];
+    let currentNode = node;
+
+    while (currentNode) {
+      pathSegments.unshift(currentNode.name);
+      currentNode = currentNode.parent_id ? nodeMap.get(currentNode.parent_id) : null;
+    }
+
+    nodes.push({
+      ...node,
+      relativePath: pathSegments.join("/"),
+    });
+  }
+
+  return nodes;
+}
+
+export async function updateNodeContent(
+  nodeId: string,
+  content: string
+): Promise<NodeRow> {
+  const result = await supabaseRequest<NodeRow[]>("nodes", {
+    method: "PATCH",
+    body: { content },
+    query: `?id=eq.${encodeURIComponent(nodeId)}`,
+  });
+
+  if (!result?.[0]) {
+    throw new Error("Failed to update node content.");
+  }
+
+  return result[0];
+}
+
+export async function deleteNodeById(nodeId: string): Promise<void> {
+  await supabaseRequest("nodes", {
+    method: "DELETE",
+    query: `?id=eq.${encodeURIComponent(nodeId)}`,
+  });
+}

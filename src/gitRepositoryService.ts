@@ -5,6 +5,10 @@ import {
   deleteProjectNodes,
   getProjectRepositoryRecord,
   updateProjectRepositoryRecord,
+  getAllProjectNodes,
+  updateNodeContent,
+  deleteNodeById,
+  createNodeRecord,
   type ProjectRepositoryRow,
 } from "./supabase.ts";
 import { persistRecords, walkRepositoryTree } from "./githubImport.ts";
@@ -861,10 +865,106 @@ export async function pushProjectChanges(
   });
 }
 
+type MergeResult = {
+  updatedCount: number;
+  createdCount: number;
+  deletedCount: number;
+  conflictedFiles: string[];
+};
+
+function hasConflictMarkers(content: string): boolean {
+  return /^<<<<<<<|^=======|^>>>>>>>/.test(content);
+}
+
+async function mergeWorktreeWithNodes(
+  projectId: string,
+  worktreePath: string
+): Promise<MergeResult> {
+  const currentNodes = await getAllProjectNodes(projectId);
+  const { records: worktreeRecords } = await walkRepositoryTree(worktreePath);
+
+  const currentNodesByPath = new Map(currentNodes.map((n) => [n.relativePath, n]));
+  const worktreeByPath = new Map(worktreeRecords.map((r) => [r.relativePath, r]));
+
+  let updatedCount = 0;
+  let createdCount = 0;
+  let deletedCount = 0;
+  const conflictedFiles: string[] = [];
+
+  // Build parent ID map for new nodes
+  const insertedNodeIdsByPath = new Map<string, string>();
+  for (const node of currentNodes) {
+    insertedNodeIdsByPath.set(node.relativePath, node.id);
+  }
+
+  // Process worktree files: update existing or create new
+  for (const [relativePath, worktreeRecord] of worktreeByPath) {
+    const currentNode = currentNodesByPath.get(relativePath);
+
+    if (currentNode) {
+      // File exists in both: check if content changed
+      if (worktreeRecord.type === "file" && currentNode.type === "file") {
+        const newContent = worktreeRecord.content || "";
+        if (newContent !== currentNode.content) {
+          await updateNodeContent(currentNode.id, newContent);
+          updatedCount++;
+
+          if (hasConflictMarkers(newContent)) {
+            conflictedFiles.push(relativePath);
+          }
+        }
+      }
+    } else {
+      // New file in worktree: create node
+      const parentRelativePath = worktreeRecord.parentRelativePath;
+      const parentId = parentRelativePath
+        ? insertedNodeIdsByPath.get(parentRelativePath) || null
+        : null;
+
+      const createdNode = await createNodeRecord({
+        project_id: projectId,
+        parent_id: parentId,
+        name: worktreeRecord.name,
+        type: worktreeRecord.type,
+        content: worktreeRecord.type === "file" ? worktreeRecord.content || "" : "",
+        language: worktreeRecord.language,
+      });
+
+      insertedNodeIdsByPath.set(relativePath, createdNode.id);
+      createdCount++;
+
+      if (
+        worktreeRecord.type === "file" &&
+        hasConflictMarkers(worktreeRecord.content || "")
+      ) {
+        conflictedFiles.push(relativePath);
+      }
+    }
+  }
+
+  // Process deleted files: remove nodes that no longer exist in worktree
+  for (const [relativePath, currentNode] of currentNodesByPath) {
+    if (!worktreeByPath.has(relativePath)) {
+      // File deleted from worktree
+      // Option: soft delete by marking, or hard delete
+      // For now, hard delete to keep nodes in sync
+      await deleteNodeById(currentNode.id);
+      deletedCount++;
+    }
+  }
+
+  return {
+    updatedCount,
+    createdCount,
+    deletedCount,
+    conflictedFiles,
+  };
+}
+
 export async function pullProjectChanges(
   projectId: string,
   githubToken: string
-): Promise<{ pulledAt: string }> {
+): Promise<{ pulledAt: string; mergeResult?: MergeResult }> {
   return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
     const status = await git.status();
 
@@ -893,9 +993,9 @@ export async function pullProjectChanges(
     const branch = (await git.branch()).current || repository.current_branch;
     await git.pull("origin", branch, { "--rebase": null });
     const pulledAt = nowIso();
-    const { records } = await walkRepositoryTree(repository.working_tree_path);
-    await deleteProjectNodes(projectId);
-    await persistRecords({ projectId, records });
+    
+    // Smart merge: update existing nodes with new content, create new ones, delete removed ones
+    const mergeResult = await mergeWorktreeWithNodes(projectId, repository.working_tree_path);
 
     await updateProjectRepositoryRecord(projectId, {
       current_branch: branch,
@@ -903,6 +1003,6 @@ export async function pullProjectChanges(
       last_commit_sha: await getLastCommitSha(git),
     });
 
-    return { pulledAt };
+    return { pulledAt, mergeResult };
   });
 }
