@@ -17,6 +17,13 @@ import {
   stageProjectChanges,
   toGitActionErrorResponse,
   unstageProjectChanges,
+  getProjectFileTree,
+  getProjectFile,
+  saveProjectFile,
+  checkoutBranch,
+  listBranches,
+  resolveConflictTakeOurs,
+  resolveConflictTakeThem,
 } from "./src/gitRepositoryService.ts";
 import {
   importGitHubRepositoryIntoProject as importGitHubRepositoryIntoProjectLegacy,
@@ -119,6 +126,42 @@ const apiRouteDocs: ApiRouteDoc[] = [
     path: "/projects/:projectId/git/pull",
     access: "internal-secret",
     description: "Pulls remote project changes into local workspace.",
+  },
+  {
+    method: "GET",
+    path: "/projects/:projectId/files",
+    access: "internal-secret",
+    description: "Returns live folder tree from repository worktree.",
+  },
+  {
+    method: "GET",
+    path: "/projects/:projectId/file",
+    access: "internal-secret",
+    description: "Returns file content from worktree (query: path=src/App.jsx).",
+  },
+  {
+    method: "POST",
+    path: "/projects/:projectId/file",
+    access: "internal-secret",
+    description: "Saves file content to worktree and syncs to nodes.",
+  },
+  {
+    method: "POST",
+    path: "/projects/:projectId/git/checkout",
+    access: "internal-secret",
+    description: "Switches to a different git branch.",
+  },
+  {
+    method: "GET",
+    path: "/projects/:projectId/git/branches",
+    access: "internal-secret",
+    description: "Lists local and remote branches.",
+  },
+  {
+    method: "POST",
+    path: "/projects/:projectId/git/resolve-conflict",
+    access: "internal-secret",
+    description: "Resolves merge conflict by taking ours or theirs.",
   },
 ];
 
@@ -499,6 +542,104 @@ app.post("/projects/:projectId/git/pull", requireInternalSecret, async (req: Req
     res
       .status(getGitActionErrorStatus(error))
       .json(toGitActionErrorResponse(error, "Failed to pull changes.", "Pull failed"));
+  }
+});
+
+// File Query APIs (Phase 3)
+
+app.get("/projects/:projectId/files", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const result = await getProjectFileTree(req.params.projectId);
+    res.status(200).json(result);
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to get file tree.", "File tree query failed"));
+  }
+});
+
+app.get("/projects/:projectId/file", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const filePath = req.query.path as string;
+    if (!filePath) {
+      res.status(400).json({ error: "Missing query parameter: path" });
+      return;
+    }
+    const result = await getProjectFile(req.params.projectId, filePath);
+    res.status(200).json(result);
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to get file.", "File read failed"));
+  }
+});
+
+app.post("/projects/:projectId/file", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const { filePath, content } = req.body || {};
+    if (!filePath || typeof content !== "string") {
+      res.status(400).json({ error: "Missing or invalid parameters: filePath, content" });
+      return;
+    }
+    const result = await saveProjectFile(req.params.projectId, filePath, content);
+    res.status(200).json(result);
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to save file.", "File write failed"));
+  }
+});
+
+// Branch Operations
+
+app.post("/projects/:projectId/git/checkout", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const { branch, githubToken } = req.body || {};
+    if (!branch) {
+      res.status(400).json({ error: "Missing parameter: branch" });
+      return;
+    }
+    const result = await checkoutBranch(req.params.projectId, branch, githubToken);
+    const status = await getProjectGitStatus(req.params.projectId);
+    res.status(200).json({ ...result, status });
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to checkout branch.", "Checkout failed"));
+  }
+});
+
+app.get("/projects/:projectId/git/branches", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const result = await listBranches(req.params.projectId);
+    res.status(200).json(result);
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to list branches.", "Branches query failed"));
+  }
+});
+
+// Conflict Resolution
+
+app.post("/projects/:projectId/git/resolve-conflict", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const { filePath, strategy } = req.body || {};
+    if (!filePath || !strategy || !["ours", "theirs"].includes(strategy)) {
+      res.status(400).json({ error: "Missing or invalid parameters: filePath, strategy (ours|theirs)" });
+      return;
+    }
+
+    const result = strategy === "ours"
+      ? await resolveConflictTakeOurs(req.params.projectId, filePath)
+      : await resolveConflictTakeThem(req.params.projectId, filePath);
+
+    const status = await getProjectGitStatus(req.params.projectId);
+    res.status(200).json({ ...result, status });
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to resolve conflict.", "Conflict resolution failed"));
   }
 });
 

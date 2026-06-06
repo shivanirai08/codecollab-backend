@@ -13,6 +13,16 @@ import {
 } from "./supabase.ts";
 import { persistRecords, walkRepositoryTree } from "./githubImport.ts";
 
+const IGNORED_DIRECTORIES = new Set([
+  ".git",
+  "node_modules",
+  ".next",
+  "dist",
+  "build",
+  "coverage",
+  ".turbo",
+]);
+
 type WorktreeOperation =
   | {
       type: "create";
@@ -1006,3 +1016,343 @@ export async function pullProjectChanges(
     return { pulledAt, mergeResult };
   });
 }
+
+// File Query APIs for Phase 3
+
+export async function getProjectFileTree(projectId: string): Promise<{
+  tree: Array<{
+    path: string;
+    name: string;
+    type: "file" | "folder";
+    size?: number;
+    modified?: string;
+  }>;
+}> {
+  const { repository } = await getSimpleGitForProject(projectId);
+  const entries: Array<{
+    path: string;
+    name: string;
+    type: "file" | "folder";
+    size?: number;
+    modified?: string;
+  }> = [];
+
+  async function walkTree(dir: string, basePath = ""): Promise<void> {
+    try {
+      const entries_ = await fs.readdir(dir, { withFileTypes: true });
+
+      for (const entry of entries_) {
+        if (entry.isSymbolicLink()) continue;
+
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = path.join(basePath, entry.name);
+
+        if (entry.isDirectory()) {
+          if (IGNORED_DIRECTORIES.has(entry.name)) continue;
+
+          entries.push({
+            path: relativePath,
+            name: entry.name,
+            type: "folder",
+          });
+
+          await walkTree(fullPath, relativePath);
+        } else if (entry.isFile()) {
+          const stat = await fs.stat(fullPath);
+          entries.push({
+            path: relativePath,
+            name: entry.name,
+            type: "file",
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`Failed to walk tree: ${dir}`, error);
+    }
+  }
+
+  await walkTree(repository.working_tree_path);
+
+  return { tree: entries };
+}
+
+export async function getProjectFile(
+  projectId: string,
+  filePath: string
+): Promise<{ content: string; path: string; size: number }> {
+  const { repository } = await getSimpleGitForProject(projectId);
+  const fullPath = path.join(repository.working_tree_path, filePath);
+
+  // Security: prevent directory traversal
+  const realPath = await fs.realpath(fullPath);
+  const realRepoPath = await fs.realpath(repository.working_tree_path);
+  if (!realPath.startsWith(realRepoPath)) {
+    throw new GitActionError({
+      error: "Access denied: path outside repository",
+      code: "invalid-path",
+      title: "Invalid file path",
+      statusCode: 403,
+    });
+  }
+
+  try {
+    const stat = await fs.stat(realPath);
+    if (!stat.isFile()) {
+      throw new GitActionError({
+        error: "Path is not a file",
+        code: "not-a-file",
+        title: "Invalid file",
+        statusCode: 400,
+      });
+    }
+
+    if (stat.size > 10 * 1024 * 1024) {
+      throw new GitActionError({
+        error: "File is too large (max 10 MB)",
+        code: "file-too-large",
+        title: "File too large",
+        statusCode: 413,
+      });
+    }
+
+    const buffer = await fs.readFile(realPath);
+    const content = buffer.toString("utf8");
+
+    return { content, path: filePath, size: stat.size };
+  } catch (error) {
+    if (error instanceof GitActionError) throw error;
+
+    throw new GitActionError({
+      error: `Failed to read file: ${String(error)}`,
+      code: "file-read-error",
+      title: "Could not read file",
+      statusCode: 400,
+    });
+  }
+}
+
+export async function saveProjectFile(
+  projectId: string,
+  filePath: string,
+  content: string
+): Promise<{ saved: boolean; path: string }> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+  const fullPath = path.join(repository.working_tree_path, filePath);
+
+  // Security: prevent directory traversal
+  const realPath = await fs.realpath(fullPath).catch(async () => {
+    // File doesn't exist yet, check parent
+    const parentPath = path.dirname(fullPath);
+    const realParent = await fs.realpath(parentPath);
+    return path.join(realParent, path.basename(fullPath));
+  });
+
+  const realRepoPath = await fs.realpath(repository.working_tree_path);
+  if (!realPath.startsWith(realRepoPath)) {
+    throw new GitActionError({
+      error: "Access denied: path outside repository",
+      code: "invalid-path",
+      title: "Invalid file path",
+      statusCode: 403,
+    });
+  }
+
+  try {
+    // Create parent directories if needed
+    const dir = path.dirname(realPath);
+    await fs.mkdir(dir, { recursive: true });
+
+    // Write file
+    await fs.writeFile(realPath, content, "utf8");
+
+    // Update node content in DB
+    const currentNodes = await getAllProjectNodes(projectId);
+    const normalizedPath = filePath.replace(/\\/g, "/");
+    const node = currentNodes.find((n) => n.relativePath === normalizedPath);
+
+    if (node) {
+      await updateNodeContent(node.id, content);
+    }
+
+    return { saved: true, path: filePath };
+  } catch (error) {
+    throw new GitActionError({
+      error: `Failed to save file: ${String(error)}`,
+      code: "file-write-error",
+      title: "Could not save file",
+      statusCode: 400,
+    });
+  }
+}
+
+// Branch Operations
+
+export async function checkoutBranch(
+  projectId: string,
+  branch: string,
+  githubToken: string
+): Promise<{ branch: string; mergeResult: MergeResult }> {
+  return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
+    const status = await git.status();
+
+    if (!status.isClean() && status.conflicted.length === 0) {
+      throw new GitActionError({
+        error: "Commit or discard local changes before switching branches.",
+        code: "dirty-worktree",
+        title: "Finish local changes first",
+        hint: "Stash or commit your changes, then try again.",
+        suggestedAction: "commit",
+        statusCode: 400,
+      });
+    }
+
+    try {
+      await git.checkout(branch);
+      const checkoutBranch = (await git.branch()).current || branch;
+
+      // Merge new branch tree with nodes
+      const mergeResult = await mergeWorktreeWithNodes(projectId, repository.working_tree_path);
+
+      await updateProjectRepositoryRecord(projectId, {
+        current_branch: checkoutBranch,
+        last_synced_at: nowIso(),
+        last_commit_sha: await getLastCommitSha(git),
+      });
+
+      return { branch: checkoutBranch, mergeResult };
+    } catch (error) {
+      if (error instanceof GitActionError) throw error;
+
+      throw new GitActionError({
+        error: `Failed to checkout branch: ${String(error)}`,
+        code: "checkout-failed",
+        title: "Branch checkout failed",
+        hint: "Make sure the branch exists and you have no uncommitted changes.",
+        suggestedAction: "retry",
+        statusCode: 400,
+      });
+    }
+  });
+}
+
+export async function listBranches(projectId: string): Promise<{
+  current: string;
+  local: string[];
+  remote: string[];
+}> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+
+  try {
+    const branchSummary = await git.branch(["-a"]);
+    const current = branchSummary.current || repository.current_branch;
+
+    const local = branchSummary.all
+      .filter((b) => !b.startsWith("remotes/"))
+      .sort();
+
+    const remote = branchSummary.all
+      .filter((b) => b.startsWith("remotes/origin/") && !b.endsWith("/HEAD"))
+      .map((b) => b.replace("remotes/origin/", ""))
+      .sort();
+
+    return { current, local, remote };
+  } catch (error) {
+    throw new GitActionError({
+      error: `Failed to list branches: ${String(error)}`,
+      code: "list-branches-failed",
+      title: "Could not list branches",
+      statusCode: 500,
+    });
+  }
+}
+
+// Conflict Resolution Helpers
+
+export async function resolveConflictTakeOurs(
+  projectId: string,
+  filePath: string
+): Promise<{ resolved: boolean; path: string }> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+  const fullPath = path.join(repository.working_tree_path, filePath);
+
+  try {
+    // Read file with conflicts
+    const content = await fs.readFile(fullPath, "utf8");
+
+    // Extract "ours" section (before =======)
+    const oursMatch = content.match(/^<<<<<<<[^\n]*\n([\s\S]*?)\n=======\n[\s\S]*?\n>>>>>>>[^\n]*$/m);
+    if (!oursMatch) {
+      throw new Error("No conflict markers found in file");
+    }
+
+    const resolved = oursMatch[1];
+    await fs.writeFile(fullPath, resolved, "utf8");
+
+    // Stage the resolved file
+    await git.add(filePath);
+
+    // Update node
+    const currentNodes = await getAllProjectNodes(projectId);
+    const normalizedPath = filePath.replace(/\\/g, "/");
+    const node = currentNodes.find((n) => n.relativePath === normalizedPath);
+
+    if (node) {
+      await updateNodeContent(node.id, resolved);
+    }
+
+    return { resolved: true, path: filePath };
+  } catch (error) {
+    throw new GitActionError({
+      error: `Failed to resolve conflict: ${String(error)}`,
+      code: "resolve-failed",
+      title: "Could not resolve conflict",
+      statusCode: 400,
+    });
+  }
+}
+
+export async function resolveConflictTakeThem(
+  projectId: string,
+  filePath: string
+): Promise<{ resolved: boolean; path: string }> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+  const fullPath = path.join(repository.working_tree_path, filePath);
+
+  try {
+    // Read file with conflicts
+    const content = await fs.readFile(fullPath, "utf8");
+
+    // Extract "theirs" section (after =======)
+    const theirsMatch = content.match(/^<<<<<<<[^\n]*\n[\s\S]*?\n=======\n([\s\S]*?)\n>>>>>>>[^\n]*$/m);
+    if (!theirsMatch) {
+      throw new Error("No conflict markers found in file");
+    }
+
+    const resolved = theirsMatch[1];
+    await fs.writeFile(fullPath, resolved, "utf8");
+
+    // Stage the resolved file
+    await git.add(filePath);
+
+    // Update node
+    const currentNodes = await getAllProjectNodes(projectId);
+    const normalizedPath = filePath.replace(/\\/g, "/");
+    const node = currentNodes.find((n) => n.relativePath === normalizedPath);
+
+    if (node) {
+      await updateNodeContent(node.id, resolved);
+    }
+
+    return { resolved: true, path: filePath };
+  } catch (error) {
+    throw new GitActionError({
+      error: `Failed to resolve conflict: ${String(error)}`,
+      code: "resolve-failed",
+      title: "Could not resolve conflict",
+      statusCode: 400,
+    });
+  }
+}
+
