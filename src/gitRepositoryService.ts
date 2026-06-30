@@ -52,6 +52,7 @@ export type GitActionSuggestion =
   | "commit"
   | "stage"
   | "resolve-conflicts"
+  | "continue-rebase"
   | "connect-github"
   | "retry";
 
@@ -255,6 +256,82 @@ function resolveWorktreePath(rootPath: string, relativePath: string): string {
   return absolutePath;
 }
 
+type GitOperationState = {
+  type: "rebase" | "merge" | null;
+  branchName: string | null;
+};
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getGitOperationState(worktreePath: string): Promise<GitOperationState> {
+  const gitDir = path.join(worktreePath, ".git");
+  const rebaseMergeDir = path.join(gitDir, "rebase-merge");
+
+  if (await pathExists(rebaseMergeDir)) {
+    const headName = await fs
+      .readFile(path.join(rebaseMergeDir, "head_name"), "utf8")
+      .catch(() => "");
+
+    return {
+      type: "rebase",
+      branchName: headName.trim().replace(/^refs\/heads\//, "") || null,
+    };
+  }
+
+  if (await pathExists(path.join(gitDir, "rebase-apply"))) {
+    return { type: "rebase", branchName: null };
+  }
+
+  if (await pathExists(path.join(gitDir, "MERGE_HEAD"))) {
+    return { type: "merge", branchName: null };
+  }
+
+  return { type: null, branchName: null };
+}
+
+async function continueRebaseIfPossible(
+  git: ReturnType<typeof simpleGit>,
+  worktreePath: string
+): Promise<boolean> {
+  const opState = await getGitOperationState(worktreePath);
+  if (opState.type !== "rebase") {
+    return false;
+  }
+
+  const status = await git.status();
+  if (status.conflicted.length > 0) {
+    return false;
+  }
+
+  await git.env({ GIT_EDITOR: "true" }).rebase(["--continue"]);
+  return true;
+}
+
+async function getAheadBehindForBranch(
+  git: ReturnType<typeof simpleGit>,
+  branchName: string
+): Promise<{ ahead: number; behind: number }> {
+  try {
+    const countOutput = await git.raw([
+      "rev-list",
+      "--left-right",
+      "--count",
+      `origin/${branchName}...${branchName}`,
+    ]);
+    const [behind, ahead] = countOutput.trim().split(/\s+/).map((value) => Number(value) || 0);
+    return { ahead, behind };
+  } catch {
+    return { ahead: 0, behind: 0 };
+  }
+}
+
 async function withRepositorySyncState<T>(
   projectId: string,
   fn: (repository: ProjectRepositoryRow) => Promise<T>
@@ -408,6 +485,10 @@ type ConflictType =
   | "deleted-by-them"
   | "unmerged";
 
+function hasConflictMarkers(content: string): boolean {
+  return /^(<<<<<<<|=======|>>>>>>>)/m.test(content);
+}
+
 function resolveConflictType(code: string): ConflictType {
   switch (code) {
     case "UU": return "both-modified";
@@ -429,6 +510,8 @@ export async function getProjectGitStatus(projectId: string): Promise<{
   isClean: boolean;
   hasConflicts: boolean;
   conflictedPaths: string[];
+  operationInProgress: "rebase" | "merge" | null;
+  needsRebaseContinue: boolean;
   summary: {
     modified: number;
     added: number;
@@ -449,12 +532,34 @@ export async function getProjectGitStatus(projectId: string): Promise<{
 }> {
   const { repository, git } = await getSimpleGitForProject(projectId);
   const status = await git.status();
+  const operationState = await getGitOperationState(repository.working_tree_path);
 
   // simple-git parses the porcelain output and provides an authoritative set
   // of unmerged (conflicted) paths.  We use this as the primary source of truth
   // and fall back to the XY status-code analysis for any file that the array
   // might miss in edge cases.
   const conflictedPathSet = new Set(status.conflicted);
+
+  for (const file of status.files) {
+    if (conflictedPathSet.has(file.path)) {
+      continue;
+    }
+
+    const indexStatus = file.index || " ";
+    const workingTreeStatus = file.working_dir || " ";
+    const isDirty =
+      indexStatus !== " " || workingTreeStatus !== " " || indexStatus === "?";
+
+    if (!isDirty) {
+      continue;
+    }
+
+    const absolutePath = resolveWorktreePath(repository.working_tree_path, file.path);
+    const content = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    if (hasConflictMarkers(content)) {
+      conflictedPathSet.add(file.path);
+    }
+  }
 
   const files = status.files.map((file) => {
     const indexStatus = file.index || " ";
@@ -488,9 +593,8 @@ export async function getProjectGitStatus(projectId: string): Promise<{
     };
   });
 
-  // For any file that simple-git placed in conflicted[] but that did not appear
-  // in files[] (rare), add a synthetic sparse entry so the panel always shows it.
-  for (const conflictedPath of status.conflicted) {
+  // For any conflicted path that did not appear in files[] (rare), add a synthetic entry.
+  for (const conflictedPath of conflictedPathSet) {
     if (!files.some((f) => f.path === conflictedPath)) {
       files.push({
         path: conflictedPath,
@@ -513,25 +617,53 @@ export async function getProjectGitStatus(projectId: string): Promise<{
     conflicted: files.filter((file) => file.status === "conflicted").length,
   };
 
-  const branch = status.current || repository.current_branch || null;
+  const hasConflicts = summary.conflicted > 0;
+  let branch = status.current || repository.current_branch || null;
+  let ahead = status.ahead || 0;
+  let behind = status.behind || 0;
+  const branchForTracking = operationState.branchName || branch;
+
+  if (branchForTracking) {
+    const remoteCounts = await getAheadBehindForBranch(git, branchForTracking);
+    if (operationState.type === "rebase" || !status.current) {
+      branch = branchForTracking;
+      ahead = remoteCounts.ahead;
+      behind = remoteCounts.behind;
+    }
+  }
+
+  const needsRebaseContinue =
+    operationState.type === "rebase" &&
+    status.conflicted.length === 0 &&
+    status.isClean();
 
   await updateProjectRepositoryRecord(projectId, {
     current_branch: branch || repository.current_branch,
     last_commit_sha: await getLastCommitSha(git),
     remote_head_sha: status.tracking || repository.remote_head_sha,
     last_synced_at: nowIso(),
-    sync_state: "idle",
-    sync_error: null,
+    sync_state: hasConflicts
+      ? "conflicts"
+      : needsRebaseContinue
+        ? "conflicts"
+        : "idle",
+    sync_error: hasConflicts
+      ? repository.sync_error || "Merge conflicts need resolution"
+      : needsRebaseContinue
+        ? "Rebase is waiting to be finished"
+        : null,
   }).catch(() => {});
 
   return {
     branch,
     tracking: status.tracking || null,
-    ahead: status.ahead || 0,
-    behind: status.behind || 0,
-    isClean: status.isClean(),
-    hasConflicts: summary.conflicted > 0,
+    ahead,
+    behind,
+    isClean: status.isClean() && !hasConflicts && !needsRebaseContinue,
+    hasConflicts,
     conflictedPaths: Array.from(conflictedPathSet),
+    operationInProgress: operationState.type,
+    needsRebaseContinue,
     summary,
     files,
   };
@@ -603,7 +735,13 @@ export async function getProjectFileDiff(
   // file itself holds the conflict markers (<<<<<<<, =======, >>>>>>>).
   // Reading the file directly is the only reliable way to surface them.
   const status = await git.status();
-  const isConflicted = status.conflicted.includes(safePath);
+  let isConflicted = status.conflicted.includes(safePath);
+
+  if (!isConflicted) {
+    const absolutePath = resolveWorktreePath(repository.working_tree_path, safePath);
+    const content = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    isConflicted = hasConflictMarkers(content);
+  }
 
   if (isConflicted) {
     const absolutePath = resolveWorktreePath(repository.working_tree_path, safePath);
@@ -662,6 +800,51 @@ export async function getProjectFileDiff(
   };
 }
 
+export async function getProjectFileCompare(
+  projectId: string,
+  relativePath: string
+): Promise<{
+  path: string;
+  original: string;
+  modified: string;
+  isConflicted: boolean;
+}> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+  const safePath = sanitizeRelativePath(relativePath);
+  const absolutePath = resolveWorktreePath(repository.working_tree_path, safePath);
+
+  const status = await git.status();
+  let isConflicted = status.conflicted.includes(safePath);
+  const modified = await fs.readFile(absolutePath, "utf8").catch(() => "");
+
+  if (!isConflicted) {
+    isConflicted = hasConflictMarkers(modified);
+  }
+
+  if (isConflicted) {
+    return {
+      path: safePath,
+      original: "",
+      modified,
+      isConflicted: true,
+    };
+  }
+
+  let original = "";
+  try {
+    original = await git.show([`HEAD:${safePath}`]);
+  } catch {
+    original = "";
+  }
+
+  return {
+    path: safePath,
+    original,
+    modified,
+    isConflicted: false,
+  };
+}
+
 export async function commitProjectChanges(
   projectId: string,
   {
@@ -709,12 +892,47 @@ export async function commitProjectChanges(
     const result = await git.commit(message);
     const commitSha = result.commit || (await getLastCommitSha(git));
 
+    await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
+
     await updateProjectRepositoryRecord(projectId, {
       last_commit_sha: commitSha,
       current_branch: status.current || repository.current_branch,
     });
 
     return { commitSha };
+  });
+}
+
+export async function continuePendingGitOperation(
+  projectId: string
+): Promise<{
+  continued: boolean;
+  status: Awaited<ReturnType<typeof getProjectGitStatus>>;
+}> {
+  return withRepositorySyncState(projectId, async (repository) => {
+    const git = simpleGit(repository.working_tree_path);
+    let continued = false;
+
+    try {
+      continued = await continueRebaseIfPossible(git, repository.working_tree_path);
+    } catch (error) {
+      throw new GitActionError({
+        error: collapseWhitespace(
+          error instanceof Error ? error.message : String(error)
+        ),
+        code: "rebase-continue-failed",
+        title: "Could not finish rebase",
+        hint: "Resolve any remaining conflicts, stage the files, then try again.",
+        suggestedAction: "resolve-conflicts",
+        statusCode: 400,
+        details: sanitizeGitDetails(
+          error instanceof Error ? error.message : String(error)
+        ),
+      });
+    }
+
+    const status = await getProjectGitStatus(projectId);
+    return { continued, status };
   });
 }
 
@@ -815,6 +1033,8 @@ export async function pushProjectChanges(
   githubToken: string
 ): Promise<{ pushedAt: string }> {
   return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
+    await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
+
     const status = await git.status();
 
     if (status.conflicted.length > 0) {
@@ -881,10 +1101,6 @@ type MergeResult = {
   deletedCount: number;
   conflictedFiles: string[];
 };
-
-function hasConflictMarkers(content: string): boolean {
-  return /^<<<<<<<|^=======|^>>>>>>>/.test(content);
-}
 
 async function mergeWorktreeWithNodes(
   projectId: string,
@@ -974,8 +1190,20 @@ async function mergeWorktreeWithNodes(
 export async function pullProjectChanges(
   projectId: string,
   githubToken: string
-): Promise<{ pulledAt: string; mergeResult?: MergeResult }> {
+): Promise<{ pulledAt: string; mergeResult: MergeResult; pullStatus: "success" | "conflicts" }> {
   return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
+    const operationState = await getGitOperationState(repository.working_tree_path);
+    if (operationState.type === "rebase") {
+      throw new GitActionError({
+        error: "Finish the in-progress rebase before pulling.",
+        code: "pull-rebase-in-progress",
+        title: "Rebase in progress",
+        hint: "Click Finish rebase to complete the ongoing pull, then try again if needed.",
+        suggestedAction: "continue-rebase",
+        statusCode: 409,
+      });
+    }
+
     const status = await git.status();
 
     if (status.conflicted.length > 0) {
@@ -1001,19 +1229,45 @@ export async function pullProjectChanges(
     }
 
     const branch = (await git.branch()).current || repository.current_branch;
-    await git.pull("origin", branch, { "--rebase": null });
+    let pullStatus: "success" | "conflicts" = "success";
+
+    try {
+      await git.pull("origin", branch, { "--rebase": null });
+    } catch (pullError) {
+      const afterStatus = await git.status();
+      if (afterStatus.conflicted.length > 0) {
+        pullStatus = "conflicts";
+      } else if (pullError instanceof GitActionError) {
+        throw pullError;
+      } else {
+        throw new GitActionError({
+          error: collapseWhitespace(
+            pullError instanceof Error ? pullError.message : String(pullError)
+          ),
+          code: "pull-failed",
+          title: "Pull failed",
+          hint: "Try again after refreshing the repository status.",
+          suggestedAction: "retry",
+          statusCode: 400,
+          details: sanitizeGitDetails(
+            pullError instanceof Error ? pullError.message : String(pullError)
+          ),
+        });
+      }
+    }
+
     const pulledAt = nowIso();
-    
-    // Smart merge: update existing nodes with new content, create new ones, delete removed ones
     const mergeResult = await mergeWorktreeWithNodes(projectId, repository.working_tree_path);
 
     await updateProjectRepositoryRecord(projectId, {
       current_branch: branch,
       last_pulled_at: pulledAt,
-      last_commit_sha: await getLastCommitSha(git),
+      last_commit_sha: await getLastCommitSha(git).catch(() => repository.last_commit_sha),
+      sync_state: pullStatus === "conflicts" ? "conflicts" : "idle",
+      sync_error: pullStatus === "conflicts" ? "Pull stopped due to merge conflicts" : null,
     });
 
-    return { pulledAt, mergeResult };
+    return { pulledAt, mergeResult, pullStatus };
   });
 }
 
@@ -1209,7 +1463,19 @@ export async function checkoutBranch(
     }
 
     try {
-      await git.checkout(branch);
+      await git.fetch(["origin", "--prune"]);
+      const branchSummary = await git.branch(["-a"]);
+      const localBranches = branchSummary.all.filter((name) => !name.startsWith("remotes/"));
+      const remoteRef = `origin/${branch}`;
+
+      if (localBranches.includes(branch)) {
+        await git.checkout(branch);
+      } else if (branchSummary.all.includes(`remotes/${remoteRef}`)) {
+        await git.checkoutBranch(branch, remoteRef);
+      } else {
+        await git.checkout(branch);
+      }
+
       const checkoutBranch = (await git.branch()).current || branch;
 
       // Merge new branch tree with nodes
@@ -1270,6 +1536,55 @@ export async function listBranches(projectId: string): Promise<{
 
 // Conflict Resolution Helpers
 
+function resolveConflictMarkers(content: string, strategy: "ours" | "theirs"): string {
+  if (!/^<<<<<<</m.test(content)) {
+    throw new Error("No conflict markers found in file");
+  }
+
+  const lines = String(content || "").split("\n");
+  const resolvedLines: string[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+
+    if (!line.startsWith("<<<<<<<")) {
+      resolvedLines.push(line);
+      index += 1;
+      continue;
+    }
+
+    const oursLines: string[] = [];
+    const theirsLines: string[] = [];
+    index += 1;
+
+    while (index < lines.length && !lines[index].startsWith("=======")) {
+      oursLines.push(lines[index]);
+      index += 1;
+    }
+
+    if (index >= lines.length || !lines[index].startsWith("=======")) {
+      throw new Error("Malformed conflict marker block");
+    }
+
+    index += 1;
+
+    while (index < lines.length && !lines[index].startsWith(">>>>>>>")) {
+      theirsLines.push(lines[index]);
+      index += 1;
+    }
+
+    if (index >= lines.length || !lines[index].startsWith(">>>>>>>")) {
+      throw new Error("Malformed conflict marker block");
+    }
+
+    index += 1;
+    resolvedLines.push(...(strategy === "ours" ? oursLines : theirsLines));
+  }
+
+  return resolvedLines.join("\n");
+}
+
 export async function resolveConflictTakeOurs(
   projectId: string,
   filePath: string
@@ -1278,16 +1593,8 @@ export async function resolveConflictTakeOurs(
   const fullPath = path.join(repository.working_tree_path, filePath);
 
   try {
-    // Read file with conflicts
     const content = await fs.readFile(fullPath, "utf8");
-
-    // Extract "ours" section (before =======)
-    const oursMatch = content.match(/^<<<<<<<[^\n]*\n([\s\S]*?)\n=======\n[\s\S]*?\n>>>>>>>[^\n]*$/m);
-    if (!oursMatch) {
-      throw new Error("No conflict markers found in file");
-    }
-
-    const resolved = oursMatch[1];
+    const resolved = resolveConflictMarkers(content, "ours");
     await fs.writeFile(fullPath, resolved, "utf8");
 
     // Stage the resolved file
@@ -1301,6 +1608,8 @@ export async function resolveConflictTakeOurs(
     if (node) {
       await updateNodeContent(node.id, resolved);
     }
+
+    await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
 
     return { resolved: true, path: filePath };
   } catch (error) {
@@ -1321,16 +1630,8 @@ export async function resolveConflictTakeThem(
   const fullPath = path.join(repository.working_tree_path, filePath);
 
   try {
-    // Read file with conflicts
     const content = await fs.readFile(fullPath, "utf8");
-
-    // Extract "theirs" section (after =======)
-    const theirsMatch = content.match(/^<<<<<<<[^\n]*\n[\s\S]*?\n=======\n([\s\S]*?)\n>>>>>>>[^\n]*$/m);
-    if (!theirsMatch) {
-      throw new Error("No conflict markers found in file");
-    }
-
-    const resolved = theirsMatch[1];
+    const resolved = resolveConflictMarkers(content, "theirs");
     await fs.writeFile(fullPath, resolved, "utf8");
 
     // Stage the resolved file
@@ -1344,6 +1645,8 @@ export async function resolveConflictTakeThem(
     if (node) {
       await updateNodeContent(node.id, resolved);
     }
+
+    await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
 
     return { resolved: true, path: filePath };
   } catch (error) {

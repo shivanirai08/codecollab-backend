@@ -251,7 +251,7 @@ export type NodeWithPath = {
 export async function getAllProjectNodes(projectId: string): Promise<NodeWithPath[]> {
   const encodedProjectId = encodeURIComponent(`eq.${projectId}`);
   const result = await supabaseRequest<any[]>("nodes", {
-    query: `?project_id=${encodedProjectId}&select=id,project_id,parent_id,name,type,content,language`,
+    query: `?project_id=${encodedProjectId}&select=id,project_id,parent_id,name,type,content`,
   });
 
   if (!result) {

@@ -8,8 +8,10 @@ import cors from "cors";
 import {
   applyWorktreeOperation,
   commitProjectChanges,
+  continuePendingGitOperation,
   getGitActionErrorStatus,
   getProjectFileDiff,
+  getProjectFileCompare,
   getProjectGitStatus,
   getProjectGitStatusWithRemote,
   pullProjectChanges,
@@ -114,6 +116,12 @@ const apiRouteDocs: ApiRouteDoc[] = [
     path: "/projects/:projectId/git/unstage",
     access: "internal-secret",
     description: "Unstages project file changes.",
+  },
+  {
+    method: "POST",
+    path: "/projects/:projectId/git/continue",
+    access: "internal-secret",
+    description: "Continues an in-progress rebase after conflicts are resolved.",
   },
   {
     method: "POST",
@@ -485,6 +493,24 @@ app.get("/projects/:projectId/git/diff", requireInternalSecret, async (req: Requ
   }
 });
 
+app.get("/projects/:projectId/git/compare", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const relativePath = String(req.query.path || "").trim();
+
+    if (!relativePath) {
+      res.status(400).json({ error: "Query parameter 'path' is required." });
+      return;
+    }
+
+    const result = await getProjectFileCompare(req.params.projectId, relativePath);
+    res.status(200).json(result);
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load file comparison.";
+    res.status(400).json({ error: message });
+  }
+});
+
 app.post("/projects/:projectId/git/commit", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
   try {
     const result = await commitProjectChanges(req.params.projectId, req.body);
@@ -516,6 +542,17 @@ app.post("/projects/:projectId/git/unstage", requireInternalSecret, async (req: 
     res
       .status(getGitActionErrorStatus(error))
       .json(toGitActionErrorResponse(error, "Failed to unstage changes.", "Unstage failed"));
+  }
+});
+
+app.post("/projects/:projectId/git/continue", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const result = await continuePendingGitOperation(req.params.projectId);
+    res.status(200).json(result);
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to continue git operation.", "Continue failed"));
   }
 });
 
