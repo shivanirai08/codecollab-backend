@@ -7,6 +7,11 @@ import {
   deleteProjectRepositoryRecord,
   deleteProjectTree,
 } from "./supabase.ts";
+import {
+  getProjectWorktreePath,
+  ensureWorktreesRoot,
+  sanitizeProjectId,
+} from "./worktreePaths.ts";
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",
@@ -65,10 +70,6 @@ export class ImportValidationError extends Error {
     this.name = "ImportValidationError";
     this.statusCode = statusCode;
   }
-}
-
-function sanitizeProjectId(projectId: string): string {
-  return String(projectId || "").replace(/[^a-zA-Z0-9-_]/g, "");
 }
 
 function buildCloneUrl({
@@ -312,13 +313,10 @@ export async function importGitHubRepositoryIntoProject(payload: ImportPayload):
     throw new ImportValidationError("Invalid project id.");
   }
 
-  const worktreesRoot =
-    process.env.CODECOLLAB_REPOS_ROOT ||
-    path.join(process.cwd(), ".data", "worktrees");
-  const checkoutDirectory = path.join(worktreesRoot, safeProjectId);
+  const checkoutDirectory = getProjectWorktreePath(projectId);
 
   await fs.rm(checkoutDirectory, { recursive: true, force: true }).catch(() => {});
-  await fs.mkdir(path.dirname(checkoutDirectory), { recursive: true });
+  await ensureWorktreesRoot();
 
   try {
     const cloneUrl = buildCloneUrl({

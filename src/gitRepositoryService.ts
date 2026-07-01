@@ -12,6 +12,10 @@ import {
   type ProjectRepositoryRow,
 } from "./supabase.ts";
 import { persistRecords, walkRepositoryTree } from "./githubImport.ts";
+import {
+  getProjectWorktreePath,
+  resolveExistingWorktreePath,
+} from "./worktreePaths.ts";
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",
@@ -342,13 +346,15 @@ async function withRepositorySyncState<T>(
     throw new Error("Project repository is not connected.");
   }
 
+  const repositoryWithWorktree = await attachResolvedWorktreePath(projectId, repository);
+
   await updateProjectRepositoryRecord(projectId, {
     sync_state: "syncing",
     sync_error: null,
   });
 
   try {
-    const result = await fn(repository);
+    const result = await fn(repositoryWithWorktree);
     await updateProjectRepositoryRecord(projectId, {
       sync_state: "idle",
       sync_error: null,
@@ -362,6 +368,45 @@ async function withRepositorySyncState<T>(
     }).catch(() => {});
     throw error;
   }
+}
+
+async function attachResolvedWorktreePath(
+  projectId: string,
+  repository: ProjectRepositoryRow
+): Promise<ProjectRepositoryRow> {
+  const workingTreePath = await resolveExistingWorktreePath(
+    projectId,
+    repository.working_tree_path
+  );
+
+  if (!workingTreePath) {
+    const expectedPath = getProjectWorktreePath(projectId);
+    await updateProjectRepositoryRecord(projectId, {
+      sync_state: "error",
+      sync_error: `Repository worktree is missing at '${expectedPath}'.`,
+    }).catch(() => {});
+
+    throw new GitActionError({
+      statusCode: 409,
+      code: "repository-worktree-missing",
+      title: "Repository worktree is unavailable",
+      error: "Repository files are not available on this backend instance.",
+      hint: "Re-import this repository from GitHub, or restore the EBS worktree volume.",
+      suggestedAction: "connect-github",
+      details: `Missing path: ${expectedPath}`,
+    });
+  }
+
+  if (workingTreePath !== repository.working_tree_path) {
+    await updateProjectRepositoryRecord(projectId, {
+      working_tree_path: workingTreePath,
+    }).catch(() => {});
+  }
+
+  return {
+    ...repository,
+    working_tree_path: workingTreePath,
+  };
 }
 
 export async function ensureOriginRemote(repository: ProjectRepositoryRow): Promise<void> {
@@ -379,51 +424,9 @@ async function getSimpleGitForProject(projectId: string): Promise<{
     throw new Error("Project repository is not connected.");
   }
 
-  const configuredWorktreeRoot =
-    process.env.CODECOLLAB_REPOS_ROOT ||
-    path.join(process.cwd(), ".data", "worktrees");
-
-  const pathExists = async (candidatePath: string): Promise<boolean> => {
-    try {
-      const stat = await fs.stat(candidatePath);
-      return stat.isDirectory();
-    } catch {
-      return false;
-    }
-  };
-
-  let workingTreePath = repository.working_tree_path;
-  const hasStoredWorktree = await pathExists(workingTreePath);
-
-  if (!hasStoredWorktree) {
-    const fallbackWorktreePath = path.join(configuredWorktreeRoot, projectId);
-    const hasFallbackWorktree = await pathExists(fallbackWorktreePath);
-
-    if (hasFallbackWorktree) {
-      workingTreePath = fallbackWorktreePath;
-      await updateProjectRepositoryRecord(projectId, {
-        working_tree_path: fallbackWorktreePath,
-      }).catch(() => {});
-    } else {
-      await updateProjectRepositoryRecord(projectId, {
-        sync_state: "error",
-        sync_error: `Repository worktree is missing at '${repository.working_tree_path}'.`,
-      }).catch(() => {});
-
-      throw new GitActionError({
-        statusCode: 409,
-        code: "repository-worktree-missing",
-        title: "Repository worktree is unavailable",
-        error: "Repository files are not available on this backend instance.",
-        hint: "Re-import this repository from GitHub, or use the backend instance that originally imported it.",
-        suggestedAction: "connect-github",
-        details: `Missing path: ${repository.working_tree_path}`,
-      });
-    }
-  }
-
-  const git = simpleGit(workingTreePath);
-  return { repository, git };
+  const repositoryWithWorktree = await attachResolvedWorktreePath(projectId, repository);
+  const git = simpleGit(repositoryWithWorktree.working_tree_path);
+  return { repository: repositoryWithWorktree, git };
 }
 
 async function getLastCommitSha(git: ReturnType<typeof simpleGit>): Promise<string | null> {

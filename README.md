@@ -61,7 +61,7 @@ Applies one operation to the project worktree:
 
 ## Environment Variables
 
-Create a `.env` file in `codecollab-backend`.
+Create a `.env` file in `backend/` (see `.env.example`).
 
 Required:
 
@@ -71,8 +71,16 @@ Required:
 Recommended:
 
 - `PORT=5000`
-- `CODECOLLAB_REPOS_ROOT=.data/worktrees`
 - `CODECOLLAB_INTERNAL_SECRET=<shared-secret-with-frontend>`
+
+### Git worktree storage
+
+| Environment | `CODECOLLAB_REPOS_ROOT` | On-disk path |
+|-------------|-------------------------|--------------|
+| **Local dev** | *(unset)* | `backend/.data/worktrees/<project-id>` (gitignored) |
+| **Production (EC2 + EBS)** | `/var/lib/codecollab/worktrees` | EBS mount at same path |
+
+Full setup guide: [`docs/worktree-storage-architecture.md`](../docs/worktree-storage-architecture.md)
 
 ## Install and Run
 
@@ -96,5 +104,6 @@ npm start
 
 - `server.ts`: Express app and route wiring
 - `src/githubImport.ts`: GitHub clone/import + node persistence
+- `src/worktreePaths.ts`: Worktree path resolution (local `.data/worktrees` vs EC2 EBS)
 - `src/gitRepositoryService.ts`: Git status/diff/stage/unstage/commit/push/pull + worktree sync
 - `src/supabase.ts`: Supabase REST helpers for project/node/repository records

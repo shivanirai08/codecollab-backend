@@ -19,5 +19,8 @@ build/
 # Your project-specific (IMPORTANT)
 workspaces/
 
+# Local Git worktrees (production uses EBS via CODECOLLAB_REPOS_ROOT)
+.data/
+
 # Optional (if you add later)
 coverage/
