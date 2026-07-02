@@ -464,9 +464,9 @@ app.get("/projects/:projectId/git/status", requireInternalSecret, async (req: Re
     const result = await getProjectGitStatusWithRemote(req.params.projectId, githubToken);
     res.status(200).json(result);
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to load git status.";
-    res.status(400).json({ error: message });
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to load git status.", "Git status failed"));
   }
 });
 
