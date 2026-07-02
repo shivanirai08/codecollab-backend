@@ -8,17 +8,45 @@ import { promises as fs } from "fs";
  * Local dev default: backend/.data/worktrees/<projectId>  (gitignored)
  * Production (EC2):  EBS mount e.g. /var/lib/codecollab/worktrees/<projectId>
  */
+
+const LOCAL_WORKTREES_ROOT = path.resolve(process.cwd(), ".data", "worktrees");
+const PRODUCTION_ROOT_PREFIXES = ["/var/lib/codecollab", "/mnt/"];
+
 export function sanitizeProjectId(projectId: string): string {
   return String(projectId || "").replace(/[^a-zA-Z0-9-_]/g, "");
 }
 
+function isLocalDevelopment(): boolean {
+  return process.env.NODE_ENV !== "production";
+}
+
+function isProductionAbsolutePath(candidatePath: string): boolean {
+  const resolved = path.resolve(candidatePath);
+  return PRODUCTION_ROOT_PREFIXES.some(
+    (prefix) => resolved === prefix || resolved.startsWith(`${prefix}/`)
+  );
+}
+
+function getLocalWorktreesRoot(): string {
+  return LOCAL_WORKTREES_ROOT;
+}
+
 export function getWorktreesRoot(): string {
+  if (isLocalDevelopment()) {
+    const configuredRoot = process.env.CODECOLLAB_REPOS_ROOT?.trim();
+    if (configuredRoot && !isProductionAbsolutePath(path.resolve(configuredRoot))) {
+      return path.resolve(configuredRoot);
+    }
+
+    return getLocalWorktreesRoot();
+  }
+
   const configuredRoot = process.env.CODECOLLAB_REPOS_ROOT?.trim();
   if (configuredRoot) {
     return path.resolve(configuredRoot);
   }
 
-  return path.resolve(process.cwd(), ".data", "worktrees");
+  return getLocalWorktreesRoot();
 }
 
 export function getProjectWorktreePath(projectId: string): string {
@@ -54,8 +82,13 @@ export async function resolveExistingWorktreePath(
     return canonicalPath;
   }
 
-  if (storedPath && (await directoryExists(storedPath))) {
-    return storedPath;
+  if (storedPath) {
+    const canUseStoredPath =
+      !isLocalDevelopment() || !isProductionAbsolutePath(storedPath);
+
+    if (canUseStoredPath && (await directoryExists(storedPath))) {
+      return storedPath;
+    }
   }
 
   return null;
