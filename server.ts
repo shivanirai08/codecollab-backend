@@ -19,6 +19,7 @@ import {
   stageProjectChanges,
   toGitActionErrorResponse,
   unstageProjectChanges,
+  discardProjectChanges,
   getProjectFileTree,
   getProjectFile,
   saveProjectFile,
@@ -116,6 +117,12 @@ const apiRouteDocs: ApiRouteDoc[] = [
     path: "/projects/:projectId/git/unstage",
     access: "internal-secret",
     description: "Unstages project file changes.",
+  },
+  {
+    method: "POST",
+    path: "/projects/:projectId/git/discard",
+    access: "internal-secret",
+    description: "Discards unstaged or staged file changes.",
   },
   {
     method: "POST",
@@ -542,6 +549,17 @@ app.post("/projects/:projectId/git/unstage", requireInternalSecret, async (req: 
     res
       .status(getGitActionErrorStatus(error))
       .json(toGitActionErrorResponse(error, "Failed to unstage changes.", "Unstage failed"));
+  }
+});
+
+app.post("/projects/:projectId/git/discard", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const result = await discardProjectChanges(req.params.projectId, req.body || {});
+    res.status(200).json(result);
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to discard changes.", "Discard failed"));
   }
 });
 

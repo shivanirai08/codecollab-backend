@@ -550,8 +550,7 @@ export async function getProjectGitStatus(projectId: string): Promise<{
 
     const indexStatus = file.index || " ";
     const workingTreeStatus = file.working_dir || " ";
-    const isDirty =
-      indexStatus !== " " || workingTreeStatus !== " " || indexStatus === "?";
+    const isDirty = indexStatus !== " " || workingTreeStatus !== " ";
 
     if (!isDirty) {
       continue;
@@ -1003,6 +1002,84 @@ export async function unstageProjectChanges(
       await git.raw(["reset", "HEAD", "--", "."]);
     } else {
       await git.raw(["reset", "HEAD", "--", ...paths]);
+    }
+
+    return {
+      status: await getProjectGitStatus(projectId),
+    };
+  });
+}
+
+export async function discardProjectChanges(
+  projectId: string,
+  options: {
+    paths?: string[];
+    discardAll?: boolean;
+    scope?: "changes" | "staged" | "all";
+  } = {}
+): Promise<{ status: Awaited<ReturnType<typeof getProjectGitStatus>> }> {
+  return withRepositorySyncState(projectId, async (repository) => {
+    const git = simpleGit(repository.working_tree_path);
+    const paths = (options.paths || [])
+      .map((relativePath) => sanitizeRelativePath(relativePath))
+      .filter(Boolean);
+    const scope = options.scope || "changes";
+
+    if (!options.discardAll && paths.length === 0) {
+      throw new GitActionError({
+        error: "Select at least one file to discard.",
+        code: "no-discard-selection",
+        title: "No files selected",
+        hint: "Pick one or more files before discarding changes.",
+        suggestedAction: "stage",
+        statusCode: 400,
+      });
+    }
+
+    const discardPaths = async (targetPaths: string[]) => {
+      const status = await git.status();
+      const untrackedPaths: string[] = [];
+      const trackedPaths: string[] = [];
+
+      for (const targetPath of targetPaths) {
+        const file = status.files.find((entry) => entry.path === targetPath);
+        const isUntracked =
+          file?.index === "?" ||
+          file?.working_dir === "?" ||
+          !file;
+
+        if (isUntracked) {
+          untrackedPaths.push(targetPath);
+        } else {
+          trackedPaths.push(targetPath);
+        }
+      }
+
+      if (trackedPaths.length > 0) {
+        if (scope === "staged") {
+          await git.raw(["restore", "--staged", "--worktree", "--", ...trackedPaths]);
+        } else {
+          await git.raw(["restore", "--staged", "--worktree", "--", ...trackedPaths]);
+        }
+      }
+
+      if (untrackedPaths.length > 0) {
+        await git.clean("f", untrackedPaths);
+      }
+    };
+
+    if (options.discardAll) {
+      if (scope === "staged") {
+        await git.raw(["restore", "--staged", "--worktree", "."]);
+      } else if (scope === "all") {
+        await git.reset(["--hard", "HEAD"]);
+        await git.clean("f", ["-d"]);
+      } else {
+        await git.raw(["restore", "."]);
+        await git.clean("f", ["-d"]);
+      }
+    } else {
+      await discardPaths(paths);
     }
 
     return {
