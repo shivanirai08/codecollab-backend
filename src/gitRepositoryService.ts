@@ -1614,6 +1614,133 @@ export async function listBranches(projectId: string): Promise<{
   }
 }
 
+function isValidBranchName(name: string): boolean {
+  if (!name || name.length > 255) return false;
+  if (name.startsWith("-") || name.startsWith(".")) return false;
+  if (name.endsWith(".") || name.endsWith(".lock")) return false;
+  if (name.includes("..") || name.includes(" ") || /[~^:?*[\]\\]/.test(name)) return false;
+  return /^[a-zA-Z0-9]/.test(name);
+}
+
+function resolveBranchStartRef(
+  startPoint: string,
+  localBranches: string[],
+  allBranches: string[]
+): string {
+  if (localBranches.includes(startPoint)) {
+    return startPoint;
+  }
+
+  const remoteRef = `origin/${startPoint}`;
+  if (allBranches.includes(`remotes/${remoteRef}`)) {
+    return remoteRef;
+  }
+
+  return startPoint;
+}
+
+export async function createBranch(
+  projectId: string,
+  options: {
+    name: string;
+    startPoint?: string | null;
+    pushToOrigin?: boolean;
+  },
+  githubToken: string
+): Promise<{ branch: string; pushed: boolean; mergeResult?: MergeResult }> {
+  const { name, startPoint, pushToOrigin = false } = options;
+  const trimmedName = name.trim();
+
+  if (!isValidBranchName(trimmedName)) {
+    throw new GitActionError({
+      error: "Invalid branch name. Use letters, numbers, /, ., _, or -.",
+      code: "invalid-branch-name",
+      title: "Invalid branch name",
+      hint: "Branch names cannot contain spaces or special characters like ~, ^, :, ?, *, [, or \\.",
+      statusCode: 400,
+    });
+  }
+
+  return withAuthenticatedRemote(projectId, githubToken, async (git, repository) => {
+    const status = await git.status();
+
+    if (!status.isClean() && status.conflicted.length === 0) {
+      throw new GitActionError({
+        error: "Commit or discard local changes before creating a branch.",
+        code: "dirty-worktree",
+        title: "Finish local changes first",
+        hint: "Stash or commit your changes, then try again.",
+        suggestedAction: "commit",
+        statusCode: 400,
+      });
+    }
+
+    try {
+      await git.fetch(["origin", "--prune"]);
+      const branchSummary = await git.branch(["-a"]);
+      const localBranches = branchSummary.all.filter((branchName) => !branchName.startsWith("remotes/"));
+      const currentBranch = branchSummary.current || repository.current_branch;
+
+      if (localBranches.includes(trimmedName)) {
+        throw new GitActionError({
+          error: `Branch "${trimmedName}" already exists.`,
+          code: "branch-exists",
+          title: "Branch already exists",
+          hint: "Choose a different name or switch to the existing branch.",
+          statusCode: 409,
+        });
+      }
+
+      const resolvedStartPoint = (startPoint?.trim() || currentBranch) as string;
+      const startRef = resolveBranchStartRef(
+        resolvedStartPoint,
+        localBranches,
+        branchSummary.all
+      );
+      const needsTreeSync = resolvedStartPoint !== currentBranch;
+
+      if (needsTreeSync) {
+        await git.checkoutBranch(trimmedName, startRef);
+      } else {
+        await git.checkoutLocalBranch(trimmedName);
+      }
+
+      const createdBranch = (await git.branch()).current || trimmedName;
+      let mergeResult: MergeResult | undefined;
+
+      if (needsTreeSync) {
+        mergeResult = await mergeWorktreeWithNodes(projectId, repository.working_tree_path);
+      }
+
+      let pushed = false;
+      if (pushToOrigin) {
+        await git.push(["-u", "origin", createdBranch]);
+        pushed = true;
+      }
+
+      await updateProjectRepositoryRecord(projectId, {
+        current_branch: createdBranch,
+        last_synced_at: nowIso(),
+        last_commit_sha: await getLastCommitSha(git),
+        ...(pushed ? { last_pushed_at: nowIso() } : {}),
+      });
+
+      return { branch: createdBranch, pushed, mergeResult };
+    } catch (error) {
+      if (error instanceof GitActionError) throw error;
+
+      throw new GitActionError({
+        error: `Failed to create branch: ${String(error)}`,
+        code: "create-branch-failed",
+        title: "Branch creation failed",
+        hint: "Make sure the start point exists and you have no uncommitted changes.",
+        suggestedAction: "retry",
+        statusCode: 400,
+      });
+    }
+  });
+}
+
 // Conflict Resolution Helpers
 
 function resolveConflictMarkers(content: string, strategy: "ours" | "theirs"): string {

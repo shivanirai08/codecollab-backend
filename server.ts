@@ -24,6 +24,7 @@ import {
   getProjectFile,
   saveProjectFile,
   checkoutBranch,
+  createBranch,
   listBranches,
   resolveConflictTakeOurs,
   resolveConflictTakeThem,
@@ -171,6 +172,12 @@ const apiRouteDocs: ApiRouteDoc[] = [
     path: "/projects/:projectId/git/branches",
     access: "internal-secret",
     description: "Lists local and remote branches.",
+  },
+  {
+    method: "POST",
+    path: "/projects/:projectId/git/branches",
+    access: "internal-secret",
+    description: "Creates a new git branch and checks it out.",
   },
   {
     method: "POST",
@@ -672,6 +679,32 @@ app.get("/projects/:projectId/git/branches", requireInternalSecret, async (req: 
     res
       .status(getGitActionErrorStatus(error))
       .json(toGitActionErrorResponse(error, "Failed to list branches.", "Branches query failed"));
+  }
+});
+
+app.post("/projects/:projectId/git/branches", requireInternalSecret, async (req: Request<ProjectParams>, res: Response) => {
+  try {
+    const { name, startPoint, pushToOrigin, githubToken } = req.body || {};
+    if (!name || typeof name !== "string") {
+      res.status(400).json({ error: "Missing parameter: name" });
+      return;
+    }
+
+    const result = await createBranch(
+      req.params.projectId,
+      {
+        name,
+        startPoint: typeof startPoint === "string" ? startPoint : null,
+        pushToOrigin: Boolean(pushToOrigin),
+      },
+      githubToken
+    );
+    const status = await getProjectGitStatus(req.params.projectId);
+    res.status(200).json({ ...result, status });
+  } catch (error) {
+    res
+      .status(getGitActionErrorStatus(error))
+      .json(toGitActionErrorResponse(error, "Failed to create branch.", "Create branch failed"));
   }
 });
 
