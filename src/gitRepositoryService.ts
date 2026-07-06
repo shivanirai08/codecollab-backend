@@ -1017,7 +1017,10 @@ export async function discardProjectChanges(
     discardAll?: boolean;
     scope?: "changes" | "staged" | "all";
   } = {}
-): Promise<{ status: Awaited<ReturnType<typeof getProjectGitStatus>> }> {
+): Promise<{
+  status: Awaited<ReturnType<typeof getProjectGitStatus>>;
+  mergeResult: MergeResult;
+}> {
   return withRepositorySyncState(projectId, async (repository) => {
     const git = simpleGit(repository.working_tree_path);
     const paths = (options.paths || [])
@@ -1082,9 +1085,13 @@ export async function discardProjectChanges(
       await discardPaths(paths);
     }
 
-    return {
-      status: await getProjectGitStatus(projectId),
-    };
+    const mergeResult = await mergeWorktreeWithNodes(
+      projectId,
+      repository.working_tree_path
+    );
+    const status = await getProjectGitStatus(projectId);
+
+    return { status, mergeResult };
   });
 }
 
