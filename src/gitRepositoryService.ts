@@ -1137,9 +1137,9 @@ export async function pushProjectChanges(
 
     if (!status.isClean()) {
       throw new GitActionError({
-        error: "Commit or discard local changes before pushing.",
+        error: "Save or discard your edits before pushing.",
         code: "push-dirty-worktree",
-        title: "Finish local changes first",
+        title: "Unsaved changes",
         hint: "Push only sends committed work. Commit your changes or discard them, then try again.",
         suggestedAction: "commit",
         statusCode: 400,
@@ -1295,10 +1295,10 @@ export async function pullProjectChanges(
 
     if (status.conflicted.length > 0) {
       throw new GitActionError({
-        error: "Resolve merge conflicts before pulling.",
+        error: "Resolve conflicted files below before continuing.",
         code: "pull-conflicts",
-        title: "Conflicts need attention",
-        hint: "Finish resolving the conflicted files before pulling new changes.",
+        title: "Merge conflicts",
+        hint: "Open each conflicted file, pick Keep Ours or Take Theirs, or edit manually. Then commit and push.",
         suggestedAction: "resolve-conflicts",
         statusCode: 409,
       });
@@ -1306,10 +1306,10 @@ export async function pullProjectChanges(
 
     if (!status.isClean()) {
       throw new GitActionError({
-        error: "Commit or discard local changes before pulling.",
+        error: "Save or discard your edits before pulling.",
         code: "pull-dirty-worktree",
-        title: "Finish local changes first",
-        hint: "Pull can reapply your branch on top of remote changes. Commit or discard local edits first.",
+        title: "Unsaved changes",
+        hint: "Pull reapplies your branch on top of remote changes. Commit or discard local edits first.",
         suggestedAction: "commit",
         statusCode: 400,
       });
@@ -1540,10 +1540,10 @@ export async function checkoutBranch(
 
     if (!status.isClean() && status.conflicted.length === 0) {
       throw new GitActionError({
-        error: "Commit or discard local changes before switching branches.",
+        error: "Save or discard your edits before switching branches.",
         code: "dirty-worktree",
-        title: "Finish local changes first",
-        hint: "Stash or commit your changes, then try again.",
+        title: "Unsaved changes",
+        hint: "Branch switching requires a clean working tree. Commit, discard, or stash your edits first.",
         suggestedAction: "commit",
         statusCode: 400,
       });
@@ -1673,10 +1673,10 @@ export async function createBranch(
 
     if (!status.isClean() && status.conflicted.length === 0) {
       throw new GitActionError({
-        error: "Commit or discard local changes before creating a branch.",
+        error: "Save or discard your edits before creating a branch.",
         code: "dirty-worktree",
-        title: "Finish local changes first",
-        hint: "Stash or commit your changes, then try again.",
+        title: "Unsaved changes",
+        hint: "Creating a branch requires a clean working tree. Commit, discard, or stash your edits first.",
         suggestedAction: "commit",
         statusCode: 400,
       });
@@ -1799,39 +1799,81 @@ function resolveConflictMarkers(content: string, strategy: "ours" | "theirs"): s
   return resolvedLines.join("\n");
 }
 
+async function resolveConflictWithStrategy(
+  projectId: string,
+  filePath: string,
+  strategy: "ours" | "theirs"
+): Promise<{ resolved: boolean; path: string }> {
+  const { repository, git } = await getSimpleGitForProject(projectId);
+  const safePath = sanitizeRelativePath(filePath);
+  const fullPath = resolveWorktreePath(repository.working_tree_path, safePath);
+  const status = await git.status();
+  const isUnmerged = status.conflicted.includes(safePath);
+
+  if (!isUnmerged) {
+    const content = await fs.readFile(fullPath, "utf8").catch(() => "");
+    if (!hasConflictMarkers(content)) {
+      throw new GitActionError({
+        error: "This file is not in a conflicted state.",
+        code: "resolve-not-conflicted",
+        title: "Nothing to resolve",
+        hint: "Refresh git status and open the file again if it still shows as conflicted.",
+        suggestedAction: "retry",
+        statusCode: 400,
+      });
+    }
+  }
+
+  if (isUnmerged) {
+    try {
+      if (strategy === "ours") {
+        await git.checkout(["--ours", "--", safePath]);
+      } else {
+        await git.checkout(["--theirs", "--", safePath]);
+      }
+    } catch {
+      // Fall back to marker parsing below.
+    }
+  }
+
+  let resolved = await fs.readFile(fullPath, "utf8").catch(() => "");
+  if (hasConflictMarkers(resolved)) {
+    resolved = resolveConflictMarkers(resolved, strategy);
+    await fs.writeFile(fullPath, resolved, "utf8");
+  }
+
+  await git.add(safePath);
+
+  const currentNodes = await getAllProjectNodes(projectId);
+  const node = currentNodes.find((n) => n.relativePath === safePath);
+  if (node) {
+    await updateNodeContent(node.id, resolved);
+  }
+
+  await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
+
+  return { resolved: true, path: safePath };
+}
+
 export async function resolveConflictTakeOurs(
   projectId: string,
   filePath: string
 ): Promise<{ resolved: boolean; path: string }> {
-  const { repository, git } = await getSimpleGitForProject(projectId);
-  const fullPath = path.join(repository.working_tree_path, filePath);
-
   try {
-    const content = await fs.readFile(fullPath, "utf8");
-    const resolved = resolveConflictMarkers(content, "ours");
-    await fs.writeFile(fullPath, resolved, "utf8");
-
-    // Stage the resolved file
-    await git.add(filePath);
-
-    // Update node
-    const currentNodes = await getAllProjectNodes(projectId);
-    const normalizedPath = filePath.replace(/\\/g, "/");
-    const node = currentNodes.find((n) => n.relativePath === normalizedPath);
-
-    if (node) {
-      await updateNodeContent(node.id, resolved);
+    return await resolveConflictWithStrategy(projectId, filePath, "ours");
+  } catch (error) {
+    if (error instanceof GitActionError) {
+      throw error;
     }
 
-    await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
-
-    return { resolved: true, path: filePath };
-  } catch (error) {
     throw new GitActionError({
-      error: `Failed to resolve conflict: ${String(error)}`,
+      error: "Could not keep our version for this file.",
       code: "resolve-failed",
-      title: "Could not resolve conflict",
+      title: "Resolution failed",
+      hint: "Open the file and resolve conflict markers manually, then stage it.",
+      suggestedAction: "resolve-conflicts",
       statusCode: 400,
+      details: String(error),
     });
   }
 }
@@ -1840,35 +1882,21 @@ export async function resolveConflictTakeThem(
   projectId: string,
   filePath: string
 ): Promise<{ resolved: boolean; path: string }> {
-  const { repository, git } = await getSimpleGitForProject(projectId);
-  const fullPath = path.join(repository.working_tree_path, filePath);
-
   try {
-    const content = await fs.readFile(fullPath, "utf8");
-    const resolved = resolveConflictMarkers(content, "theirs");
-    await fs.writeFile(fullPath, resolved, "utf8");
-
-    // Stage the resolved file
-    await git.add(filePath);
-
-    // Update node
-    const currentNodes = await getAllProjectNodes(projectId);
-    const normalizedPath = filePath.replace(/\\/g, "/");
-    const node = currentNodes.find((n) => n.relativePath === normalizedPath);
-
-    if (node) {
-      await updateNodeContent(node.id, resolved);
+    return await resolveConflictWithStrategy(projectId, filePath, "theirs");
+  } catch (error) {
+    if (error instanceof GitActionError) {
+      throw error;
     }
 
-    await continueRebaseIfPossible(git, repository.working_tree_path).catch(() => {});
-
-    return { resolved: true, path: filePath };
-  } catch (error) {
     throw new GitActionError({
-      error: `Failed to resolve conflict: ${String(error)}`,
+      error: "Could not take their version for this file.",
       code: "resolve-failed",
-      title: "Could not resolve conflict",
+      title: "Resolution failed",
+      hint: "Open the file and resolve conflict markers manually, then stage it.",
+      suggestedAction: "resolve-conflicts",
       statusCode: 400,
+      details: String(error),
     });
   }
 }
